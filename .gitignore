@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# CUAD is a 40MB+ external download (see eval/cuad_preflight/README or
+# CUAD_DATA_DIR in .env.example) -- fetched locally, not committed.
+eval/cuad_preflight/data/
+eval/cuad_preflight/reports/
+
+# Immutable audit log output (query/filters/audit_log.py) -- local runtime
+# data, not source.
+audit/
