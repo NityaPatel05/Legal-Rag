@@ -1,0 +1,51 @@
+[project]
+name = "legal-contract-rag"
+version = "0.0.1"
+description = "Clause-level RAG system for legal contract analysis (scaffold only, no implementation yet)."
+readme = "README.md"
+requires-python = ">=3.11"
+
+# See docs/architecture.md §8 for the rationale behind each choice, and
+# CLAUDE.md for the current-scope decisions (Qdrant, Docling, LangSmith,
+# prompted-LLM jailbreak classifier). LLM provider: Groq (free-tier hosted).
+#
+# BGE-M3 (FlagEmbedding + torch) is deliberately NOT listed here -- the main
+# app talks to it over HTTP (ingestion/embedding/embedder.py's BGEM3Embedder)
+# rather than loading the model in-process, so those heavy ML deps live only
+# in embedding_server/requirements.txt, the one service that actually needs
+# them. Keeps the main app image small and its startup fast.
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "langchain",
+    "langgraph",
+    "qdrant-client",
+    "cohere",             # reranker
+    "docling",
+    "groq",               # LLM provider: metadata tagging, context enrichment, jailbreak classifier
+    "rank_bm25",           # keyword-search half of hybrid retrieval
+    "ragas",
+    "datasets",           # CUAD loading
+    "langsmith",
+    "pydantic",
+    "pydantic-settings",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+]
+# Later swap-in once pipeline logic is validated (see architecture.md §8)
+voyage = [
+    "voyageai",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

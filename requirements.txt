@@ -1,0 +1,44 @@
+# Legal Contract Clause Analysis RAG
+# See docs/architecture.md §8 for rationale on each choice.
+
+# --- API server ---
+fastapi
+uvicorn[standard]
+
+# --- Orchestration ---
+langchain
+langgraph
+
+# --- Vector store ---
+qdrant-client
+
+# --- Embeddings ---
+# BGE-M3 (FlagEmbedding + torch) is deliberately NOT here -- the main app
+# talks to it over HTTP (see ingestion/embedding/embedder.py's
+# BGEM3Embedder) rather than loading the model in-process. Those heavy ML
+# deps live only in embedding_server/requirements.txt.
+# voyageai              # optional later swap-in for embeddings + reranker
+
+# --- Reranking ---
+cohere                 # Cohere Rerank
+
+# --- Document parsing ---
+docling
+
+# --- LLM provider (metadata tagging, context enrichment, jailbreak classifier) ---
+groq                     # free-tier hosted inference, default model: openai/gpt-oss-120b
+
+# --- Hybrid retrieval ---
+rank_bm25                # keyword-search half of hybrid retrieval
+
+# --- Eval ---
+ragas
+datasets                # for loading CUAD (Hugging Face: theatticusproject/cuad-qa)
+
+# --- Observability ---
+langsmith
+
+# --- General ---
+pydantic
+pydantic-settings
+python-dotenv
