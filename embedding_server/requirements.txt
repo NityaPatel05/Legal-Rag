@@ -1,0 +1,7 @@
+# Deliberately separate from the main app's requirements.txt -- this
+# service needs FlagEmbedding + torch (large, ML-heavy), the main app
+# doesn't and shouldn't pull them in.
+fastapi
+uvicorn[standard]
+FlagEmbedding
+torch
