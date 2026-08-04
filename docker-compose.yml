@@ -1,0 +1,64 @@
+# Local/dev deployment. `docker compose up --build`, then see README.md's
+# deployment section for the ingest -> query smoke test.
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    # No healthcheck here -- qdrant/qdrant is a third-party image and its
+    # available shell tools (curl/wget/bash) weren't verified in this
+    # environment. The app retries its own Qdrant connection on startup
+    # instead (see app/main.py's _ensure_qdrant_collection), so correctness
+    # doesn't depend on this healthcheck being right.
+
+  embedding-server:
+    build:
+      context: .
+      dockerfile: embedding_server/Dockerfile
+    ports:
+      # Host-side 8081 -- 8080 is already taken by another project's
+      # kafka-ui container on this machine. Container-internal port (and
+      # every in-cluster reference to it, e.g. BGE_M3_ENDPOINT below) stays
+      # 8080, since that's Docker-network-internal and unaffected by the
+      # host remap.
+      - "8081:8080"
+    healthcheck:
+      # python, not curl/wget -- python:3.11-slim doesn't ship either, but
+      # definitely has python since that's the base image itself.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s # first /embed call downloads the ~2GB BGE-M3 model
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override whatever's in .env for the two in-cluster services --
+      # .env's defaults (localhost) are for running the app outside compose.
+      QDRANT_URL: http://qdrant:6333
+      BGE_M3_ENDPOINT: http://embedding-server:8080
+      AUDIT_LOG_PATH: /app/audit/audit.jsonl
+    depends_on:
+      - qdrant
+      - embedding-server
+    volumes:
+      - audit_logs:/app/audit
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  qdrant_data:
+  audit_logs:
