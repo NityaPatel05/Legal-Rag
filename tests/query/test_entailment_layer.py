@@ -10,33 +10,45 @@ CLAUSE = make_clause(
     section_id="4",
 )
 SHOWN = [RetrievedClause(clause=CLAUSE, metadata=make_metadata(), score=1.0, source="hybrid")]
-# Same words, same numbers, same negation -- the obligor is swapped. Every
-# lexical check passes this; only entailment catches it.
+# Same words, same numbers, same negation -- the obligor is swapped. The
+# lexical layer's obligor check now catches this (it used to need NLI).
 SWAPPED = Citation(
     section_id="doc::clause-004",
     claim_text="The Customer shall indemnify the Supplier against all third-party claims.",
     supporting_quote="The Supplier shall indemnify the Customer against all third-party claims",
 )
+# Scope broadening ("all claims" vs "all third-party claims"): every lexical
+# check passes -- only entailment catches it.
+BROADENED = SWAPPED.model_copy(
+    update={"claim_text": "The Supplier shall indemnify the Customer against all claims."}
+)
 
 
 class FakeNLI:
-    """Entails only when the hypothesis names the same obligor first."""
+    """Entails unless the hypothesis is one of `rejected`."""
 
-    def __init__(self):
+    def __init__(self, rejected: tuple[str, ...] = (BROADENED.claim_text,)):
         self.calls: list[tuple[str, str]] = []
+        self._rejected = rejected
 
     def entails(self, premise: str, hypothesis: str) -> bool:
         self.calls.append((premise, hypothesis))
-        return premise.lower().split()[:2] == hypothesis.lower().split()[:2]
+        return hypothesis not in self._rejected
 
 
-def test_lexical_checks_alone_accept_a_swapped_obligor():
-    assert validate_citation(SWAPPED, source_clauses=[CLAUSE], shown_clauses=SHOWN).is_valid
+def test_lexical_obligor_check_rejects_a_swapped_obligor():
+    result = validate_citation(SWAPPED, source_clauses=[CLAUSE], shown_clauses=SHOWN)
+    assert not result.is_valid
+    assert "attributes the obligation" in result.failure_reason
 
 
-def test_entailment_layer_rejects_swapped_obligor():
+def test_lexical_checks_alone_accept_a_broadened_claim():
+    assert validate_citation(BROADENED, source_clauses=[CLAUSE], shown_clauses=SHOWN).is_valid
+
+
+def test_entailment_layer_rejects_a_broadened_claim():
     result = validate_citation(
-        SWAPPED, source_clauses=[CLAUSE], shown_clauses=SHOWN, entailment_checker=FakeNLI()
+        BROADENED, source_clauses=[CLAUSE], shown_clauses=SHOWN, entailment_checker=FakeNLI()
     )
     assert not result.is_valid
     assert "entailed" in result.failure_reason
