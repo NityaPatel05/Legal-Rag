@@ -25,7 +25,7 @@ from datetime import date
 from pydantic import BaseModel, Field
 
 from ingestion.metadata.llm_client import LLMClient
-from ingestion.metadata.normalize import normalize_place
+from ingestion.metadata.normalize import normalize_place, place_mentioned
 from ingestion.metadata.vocabulary import CONTRACT_TYPES, normalize_contract_type, prompt_list
 from ingestion.schemas import ClauseMetadata
 
@@ -79,6 +79,20 @@ def parse_iso_date(value) -> date | None:
         return None
 
 
+# The profile's governing_law / jurisdiction are merged onto EVERY clause
+# and become filter values for the whole contract, so they are only kept
+# when the contract text names that place in a sentence that is about
+# governing law / venue (review finding S4): an injected instruction or a
+# hallucination can't retarget the filters of the whole document.
+_GOVERNING_LAW_CUES = ("govern", "laws of", "law of", "construed")
+_JURISDICTION_CUES = ("jurisdiction", "court", "venue", "forum", "arbitrat")
+
+
+def _grounded(value, raw_text: str, cues: tuple[str, ...]) -> str | None:
+    place = normalize_place(value)
+    return place if place and place_mentioned(place, raw_text, near=cues) else None
+
+
 def extract_document_profile(raw_text: str, *, llm_client: LLMClient) -> DocumentProfile:
     result = llm_client.generate_json(SYSTEM_PROMPT, _document_excerpt(raw_text))
     parties = result.get("parties") or []
@@ -88,8 +102,8 @@ def extract_document_profile(raw_text: str, *, llm_client: LLMClient) -> Documen
         contract_type=normalize_contract_type(result.get("contract_type")),
         parties=[str(p) for p in parties] if isinstance(parties, list) else [],
         effective_date=parse_iso_date(result.get("effective_date")),
-        governing_law=normalize_place(result.get("governing_law")),
-        jurisdiction=normalize_place(result.get("jurisdiction")),
+        governing_law=_grounded(result.get("governing_law"), raw_text, _GOVERNING_LAW_CUES),
+        jurisdiction=_grounded(result.get("jurisdiction"), raw_text, _JURISDICTION_CUES),
     )
 
 

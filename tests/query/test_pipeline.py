@@ -15,11 +15,14 @@ class FakeLLMClient:
         self.jailbreak_user_prompts: list[str] = []
 
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict:
-        if "security classifier" in system_prompt:
+        # Jailbreak check and route come from ONE screen call (query_screen.py).
+        if "input screen" in system_prompt:
             self.jailbreak_user_prompts.append(user_prompt)
-            return {"is_flagged": self._jailbreak_flagged, "reason": "blocked" if self._jailbreak_flagged else None}
-        if "query router" in system_prompt:
-            return {"route": self._route}
+            return {
+                "is_flagged": self._jailbreak_flagged,
+                "reason": "blocked" if self._jailbreak_flagged else None,
+                "route": self._route,
+            }
         raise AssertionError(f"unexpected system prompt: {system_prompt}")
 
 

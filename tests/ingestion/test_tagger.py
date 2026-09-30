@@ -1,6 +1,6 @@
 from datetime import date
 
-from ingestion.metadata.tagger import tag_clause
+from ingestion.metadata.tagger import tag_and_enrich_clause
 from ingestion.schemas import Clause, PrivilegeLevel
 
 
@@ -45,7 +45,7 @@ def test_jurisdiction_and_governing_law_land_in_separate_fields():
         }
     )
 
-    metadata = tag_clause(
+    metadata, _ = tag_and_enrich_clause(
         _sample_clause(),
         tenant_id="tenant-1",
         matter_id="matter-1",
@@ -80,7 +80,7 @@ def test_tenant_and_matter_id_come_from_caller_not_llm_response():
         }
     )
 
-    metadata = tag_clause(
+    metadata, _ = tag_and_enrich_clause(
         _sample_clause(),
         tenant_id="tenant-1",
         matter_id="matter-1",
@@ -96,7 +96,7 @@ def test_tenant_and_matter_id_come_from_caller_not_llm_response():
 def test_missing_optional_fields_default_safely():
     llm_client = FakeLLMClient({})
 
-    metadata = tag_clause(
+    metadata, _ = tag_and_enrich_clause(
         _sample_clause(),
         tenant_id="tenant-1",
         matter_id="matter-1",
@@ -111,8 +111,6 @@ def test_missing_optional_fields_default_safely():
 
 
 def test_tag_and_enrich_clause_returns_metadata_and_note_from_one_call():
-    from ingestion.metadata.tagger import tag_and_enrich_clause
-
     class OneShotLLM:
         def __init__(self):
             self.calls = []
@@ -142,13 +140,13 @@ def test_tag_and_enrich_clause_returns_metadata_and_note_from_one_call():
     assert "4 Governing Law" in llm.calls[0]
     assert metadata.clause_type == "Governing Law"
     assert metadata.governing_law == "delaware"
-    assert metadata.jurisdiction == "new york"
+    # The clause never mentions New York: an ungrounded place is dropped
+    # (normalize.place_mentioned, review finding S4).
+    assert metadata.jurisdiction is None
     assert note == "Section 4 of the Acme / Globex MSA; sets governing law."
 
 
 def test_tag_and_enrich_clause_tolerates_a_missing_or_blank_note():
-    from ingestion.metadata.tagger import tag_and_enrich_clause
-
     class NoNoteLLM:
         def generate_json(self, system_prompt, user_prompt):
             return {"clause_type": "not-a-real-label", "context_note": "   "}

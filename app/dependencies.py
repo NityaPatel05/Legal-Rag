@@ -14,10 +14,18 @@ the full CLAUDE.md tech stack wants more.
 
 Authentication is the exception: it fails closed (check_auth_configured,
 authorize_tenant). Missing credentials config never degrades into "anyone
-may act as any tenant"."""
+may act as any tenant".
+
+LLM clients are assembled per request (scoped_llm_clients): the response
+cache is namespaced by tenant + matter + model, and sits INSIDE the
+PII-redacting wrapper so its key is computed over exactly what is sent. The
+privileged (self-hosted) client is never redacted -- its text doesn't leave
+the boundary, and redaction would make quotes of redacted spans fail
+validation (review finding L5)."""
 
 from __future__ import annotations
 
+import hashlib
 from functools import lru_cache
 
 from fastapi import Header, HTTPException, Request
@@ -26,11 +34,18 @@ from ingestion.config import Settings, get_settings
 from ingestion.embedding.document_reader import QdrantDocumentReader
 from ingestion.embedding.embedder import BGEM3Embedder, EmbeddingClient
 from ingestion.embedding.indexer import QdrantIndexer
-from ingestion.metadata.llm_client import GroqLLMClient, LLMClient, OpenAICompatibleLLMClient
+from ingestion.metadata.llm_client import (
+    CachingLLMClient,
+    GroqLLMClient,
+    LLMClient,
+    LLMResponseCache,
+    OpenAICompatibleLLMClient,
+    SQLiteLLMCache,
+)
 from ingestion.parsing.document_loader import DoclingLoader
 from ingestion.pipeline import RedactingLLMClient
 from ingestion.schemas import PrivilegeLevel
-from query.filters.audit_log import AuditLogger, JSONLAuditLogger
+from query.filters.audit_log import AuditEvent, AuditLogger, JSONLAuditLogger
 from query.observability.langsmith_tracer import LangSmithTraceExporter, NullTraceExporter, TraceExporter
 from query.review.store import ReviewStore, SQLiteReviewStore
 from query.retrieval.reranker import CohereReranker, PassthroughReranker, Reranker
@@ -46,22 +61,31 @@ class Dependencies:
         self.settings = settings
 
         self.embedding_client: EmbeddingClient = BGEM3Embedder(settings.bge_m3_endpoint)
+        self.raw_llm_client: LLMClient = GroqLLMClient(
+            api_key=settings.groq_api_key or "",
+            model=settings.groq_model,
+            max_attempts=settings.llm_max_attempts,
+            reasoning_effort=settings.groq_reasoning_effort or None,
+        )
         # Structured PII is redacted from every prompt sent to the default
         # provider, at query time too (R9). A quote the model copies from a
         # redacted span fails verbatim validation -- the safe failure.
-        self.llm_client: LLMClient = RedactingLLMClient(
-            GroqLLMClient(api_key=settings.groq_api_key or "", model=settings.groq_model)
-        )
-        # Self-hosted model for privileged documents, or None (R9).
+        self.llm_client: LLMClient = RedactingLLMClient(self.raw_llm_client)
+        # Self-hosted model for privileged documents, or None (R9). Not
+        # redacted: see module docstring.
         self.privileged_llm_client: LLMClient | None = (
-            RedactingLLMClient(
-                OpenAICompatibleLLMClient(
-                    settings.privileged_llm_base_url,
-                    settings.privileged_llm_model or "default",
-                    settings.privileged_llm_api_key,
-                )
+            OpenAICompatibleLLMClient(
+                settings.privileged_llm_base_url,
+                settings.privileged_llm_model or "default",
+                settings.privileged_llm_api_key,
+                max_attempts=settings.llm_max_attempts,
             )
             if settings.privileged_llm_base_url
+            else None
+        )
+        self.llm_cache: LLMResponseCache | None = (
+            SQLiteLLMCache(settings.llm_cache_path, max_age_seconds=settings.llm_cache_max_age_days * 86400)
+            if settings.llm_cache_path
             else None
         )
         self.entailment_checker: EntailmentChecker | None = (
@@ -101,12 +125,54 @@ def get_dependencies() -> Dependencies:
     return Dependencies(get_settings())
 
 
-def llm_for_privilege(deps: Dependencies, privilege_level: PrivilegeLevel) -> LLMClient | None:
+def scoped_llm_clients(deps, tenant_id: str, matter_id: str) -> tuple[LLMClient, LLMClient | None]:
+    """(default client, privileged client or None) for one request, with the
+    response cache namespaced to this tenant + matter. Without a cache (or
+    with test doubles that don't have one) the plain clients come back."""
+    cache = getattr(deps, "llm_cache", None)
+    raw = getattr(deps, "raw_llm_client", None)
+    default, privileged = deps.llm_client, deps.privileged_llm_client
+    if cache is None:
+        return default, privileged
+    scope = f"{tenant_id}\x1f{matter_id}"
+    if raw is not None:
+        model = getattr(raw, "model", "default")
+        default = RedactingLLMClient(CachingLLMClient(raw, cache, f"default\x1f{model}\x1f{scope}"))
+    if privileged is not None:
+        model = getattr(privileged, "model", "default")
+        privileged = CachingLLMClient(privileged, cache, f"privileged\x1f{model}\x1f{scope}")
+    return default, privileged
+
+
+def llm_for_privilege(
+    deps, privilege_level: PrivilegeLevel, tenant_id: str | None = None, matter_id: str | None = None
+) -> LLMClient | None:
     """The LLM allowed to see text at this privilege level (see
     ingestion.pipeline.select_llm_client), or None if none may."""
-    if privilege_level == PrivilegeLevel.PRIVILEGED:
-        return deps.privileged_llm_client
-    return deps.llm_client
+    if tenant_id is not None and matter_id is not None:
+        default, privileged = scoped_llm_clients(deps, tenant_id, matter_id)
+    else:
+        default, privileged = deps.llm_client, deps.privileged_llm_client
+    return privileged if privilege_level == PrivilegeLevel.PRIVILEGED else default
+
+
+def actor_id(api_key: str | None, settings: Settings) -> str:
+    """Who made the request, for the audit log (review finding S7): a short
+    hash of the API key -- never the key itself -- or "dev-loopback"."""
+    if not settings.api_keys:
+        return "dev-loopback"
+    return "key:" + hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:12]
+
+
+class ActorAuditLogger:
+    """Stamps every event of one request with its actor."""
+
+    def __init__(self, inner: AuditLogger, actor: str):
+        self._inner = inner
+        self._actor = actor
+
+    def log(self, event: AuditEvent) -> None:
+        self._inner.log(event if event.actor else event.model_copy(update={"actor": self._actor}))
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})

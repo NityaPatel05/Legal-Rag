@@ -76,7 +76,29 @@ def test_privileged_document_uses_self_hosted_llm_when_configured():
 
     assert default_llm.prompts == []
     assert private_llm.prompts
-    assert store.upserted[0].metadata.governing_law == "delaware"
+    # The self-hosted model's output is what was stored...
+    assert store.upserted[0].context_note == "This clause is part of a services agreement."
+    assert store.upserted[0].metadata.contract_type == "Service"
+    # ...but a place the contract never names is dropped (S4 grounding).
+    assert store.upserted[0].metadata.governing_law is None
+
+
+def test_privileged_text_reaches_the_self_hosted_llm_unredacted():
+    """L5: redacting privileged text for the self-hosted model made every
+    quote of a redacted digit run fail verbatim validation, for no benefit
+    -- that text never leaves the boundary."""
+    default_llm, private_llm = RecordingLLMClient(), RecordingLLMClient()
+    _ingest(PrivilegeLevel.PRIVILEGED, default_llm, private_llm)
+    assert any("123-45-6789" in p for p in private_llm.prompts)
+
+
+def test_default_llm_is_redacted_once_not_twice():
+    from ingestion.pipeline import RedactingLLMClient, redacting
+
+    inner = RecordingLLMClient()
+    wrapped = redacting(inner)
+    assert isinstance(wrapped, RedactingLLMClient)
+    assert redacting(wrapped) is wrapped
 
 
 def test_injection_flag_is_stored_on_the_clause():

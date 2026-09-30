@@ -69,6 +69,11 @@ class ClauseMetadata(BaseModel):
     # by the LLM: clause text that reads like instructions to a model.
     injection_suspected: bool = False
     injection_markers: list[str] = Field(default_factory=list)
+    # Content hash of the ingest that wrote this point (pipeline.py). A
+    # re-ingest writes the new version first and only then deletes points
+    # carrying any other version, so a failure mid-way never loses the
+    # document (review finding B15).
+    ingest_version: str | None = None
 
 
 class TaggedClause(BaseModel):

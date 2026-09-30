@@ -19,9 +19,16 @@ document_id is caller-chosen, so two tenants can both ingest a
 overwrite the first tenant's points -- a cross-tenant integrity failure no
 query-time filter can detect.
 
-Re-ingestion is delete-then-write (delete_document), not a bare upsert: a
-revised contract with fewer clauses would otherwise leave the old version's
-trailing clauses in the index, retrievable and citable.
+Re-ingestion is write-then-delete-stale (review finding B15): every point
+carries the ingest's `ingest_version` (a content hash); the new version is
+upserted first -- same point ids overwrite in place -- and only then are the
+document's points with any OTHER version deleted (delete_stale_versions), so
+a revised contract with fewer clauses doesn't leave its old tail retrievable
+and citable, and a failure between the two steps leaves the document
+queryable rather than half-deleted. (The previous delete-then-write order
+lost the whole document if an upsert failed.) Queries running during the
+switch can briefly see a mix of old and new points; a current-version
+pointer would close that and is roadmap A3.
 
 document_id is stored as its own field too (derived from clause_id, which
 clause_parser.py always constructs as f"{document_id}::clause-{idx}") so a
@@ -49,7 +56,7 @@ _UUID_NAMESPACE = uuid.UUID("6f9cc1a4-2b0e-4f0a-9c1a-4b2b0e4f0a9c")
 # Payload fields every read path filters on. tenant_id is flagged is_tenant
 # so Qdrant co-locates each tenant's vectors (see Qdrant's multitenancy
 # guide); the rest are plain keyword indexes.
-_KEYWORD_INDEXES = ("matter_id", "document_id", "record_type", "jurisdiction", "governing_law")
+_KEYWORD_INDEXES = ("matter_id", "document_id", "record_type", "jurisdiction", "governing_law", "ingest_version")
 
 
 def document_id_from_clause_id(clause_id: str) -> str:
@@ -75,6 +82,16 @@ def point_id_for_defined_term(document_id: str, index: int, *, tenant_id: str, m
 class VectorStore(Protocol):
     def delete_document(self, *, document_id: str, tenant_id: str, matter_id: str) -> None: ...
 
+    def delete_stale_versions(
+        self, *, document_id: str, tenant_id: str, matter_id: str, keep_version: str
+    ) -> None: ...
+
+    def document_info(self, *, document_id: str, tenant_id: str, matter_id: str) -> dict | None:
+        """{"privilege_level", "ingest_version"} of the indexed document, or
+        None if it isn't indexed. Used to refuse a privilege downgrade on
+        re-ingest (S3) and to skip re-ingesting unchanged content."""
+        ...
+
     def upsert(self, tagged_clauses: list[TaggedClause]) -> None: ...
 
     def upsert_references(
@@ -85,6 +102,7 @@ class VectorStore(Protocol):
         matter_id: str,
         references: list[SectionReference],
         vector_dim: int,
+        ingest_version: str | None = None,
     ) -> None: ...
 
     def upsert_defined_terms(
@@ -95,6 +113,7 @@ class VectorStore(Protocol):
         matter_id: str,
         defined_terms: list[DefinedTerm],
         vector_dim: int,
+        ingest_version: str | None = None,
     ) -> None: ...
 
 
@@ -143,26 +162,62 @@ class QdrantIndexer:
                 field_schema=PayloadSchemaType.KEYWORD,
             )
 
+    @staticmethod
+    def _document_conditions(document_id: str, tenant_id: str, matter_id: str) -> list:
+        from qdrant_client.models import FieldCondition, MatchValue  # lazy import
+
+        return [
+            FieldCondition(key="document_id", match=MatchValue(value=document_id)),
+            FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)),
+            FieldCondition(key="matter_id", match=MatchValue(value=matter_id)),
+        ]
+
     def delete_document(self, *, document_id: str, tenant_id: str, matter_id: str) -> None:
-        from qdrant_client.models import (  # lazy import
-            FieldCondition,
-            Filter,
-            FilterSelector,
-            MatchValue,
+        from qdrant_client.models import Filter, FilterSelector  # lazy import
+
+        self._client_instance().delete(
+            collection_name=self._collection_name,
+            points_selector=FilterSelector(
+                filter=Filter(must=self._document_conditions(document_id, tenant_id, matter_id))
+            ),
         )
+
+    def delete_stale_versions(
+        self, *, document_id: str, tenant_id: str, matter_id: str, keep_version: str
+    ) -> None:
+        from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue  # lazy import
 
         self._client_instance().delete(
             collection_name=self._collection_name,
             points_selector=FilterSelector(
                 filter=Filter(
-                    must=[
-                        FieldCondition(key="document_id", match=MatchValue(value=document_id)),
-                        FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)),
-                        FieldCondition(key="matter_id", match=MatchValue(value=matter_id)),
-                    ]
+                    must=self._document_conditions(document_id, tenant_id, matter_id),
+                    # Points written before versioning have no ingest_version,
+                    # don't match keep_version either, and are removed too.
+                    must_not=[FieldCondition(key="ingest_version", match=MatchValue(value=keep_version))],
                 )
             ),
         )
+
+    def document_info(self, *, document_id: str, tenant_id: str, matter_id: str) -> dict | None:
+        from qdrant_client.models import FieldCondition, Filter, MatchValue  # lazy import
+
+        points, _ = self._client_instance().scroll(
+            collection_name=self._collection_name,
+            scroll_filter=Filter(
+                must=[
+                    *self._document_conditions(document_id, tenant_id, matter_id),
+                    FieldCondition(key="record_type", match=MatchValue(value="clause")),
+                ]
+            ),
+            limit=1,
+            with_payload=["privilege_level", "ingest_version"],
+            with_vectors=False,
+        )
+        if not points:
+            return None
+        payload = points[0].payload or {}
+        return {"privilege_level": payload.get("privilege_level"), "ingest_version": payload.get("ingest_version")}
 
     def upsert(self, tagged_clauses: list[TaggedClause]) -> None:
         from qdrant_client.models import PointStruct  # lazy import
@@ -211,6 +266,7 @@ class QdrantIndexer:
         matter_id: str,
         references: list[SectionReference],
         vector_dim: int,
+        ingest_version: str | None = None,
     ) -> None:
         self._upsert_aux_points(
             [
@@ -226,6 +282,7 @@ class QdrantIndexer:
                     "source_clause_id": ref.source_clause_id,
                     "referenced_section_id": ref.referenced_section_id,
                     "raw_text": ref.raw_text,
+                    "ingest_version": ingest_version,
                 }
                 for ref in references
             ],
@@ -240,6 +297,7 @@ class QdrantIndexer:
         matter_id: str,
         defined_terms: list[DefinedTerm],
         vector_dim: int,
+        ingest_version: str | None = None,
     ) -> None:
         self._upsert_aux_points(
             [
@@ -255,6 +313,7 @@ class QdrantIndexer:
                     "term": term.term,
                     "definition": term.definition,
                     "defined_in_clause_id": term.defined_in_clause_id,
+                    "ingest_version": ingest_version,
                 }
                 for term in defined_terms
             ],

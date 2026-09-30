@@ -22,6 +22,7 @@ NOT markers -- a scanner that flags every consumer agreement is ignored."""
 from __future__ import annotations
 
 import re
+import unicodedata
 
 _PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
     (name, re.compile(pattern, re.IGNORECASE | re.MULTILINE))
@@ -53,4 +54,15 @@ _PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
 def scan_for_injection(text: str) -> list[str]:
     """Names of the injection patterns found in `text`, sorted, deduplicated.
     Empty list = nothing instruction-like found."""
+    text = _canonical(text)
     return sorted({name for name, pattern in _PATTERNS if pattern.search(text)})
+
+
+_ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠﻿­"), None)
+
+
+def _canonical(text: str) -> str:
+    """NFKC folds full-width / stylised letters ("ｉｇｎｏｒｅ") onto ASCII, and
+    zero-width characters and soft hyphens are dropped, so "ig​nore
+    previous instructions" can't slip past the patterns (review finding S4)."""
+    return unicodedata.normalize("NFKC", text).translate(_ZERO_WIDTH)

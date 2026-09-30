@@ -49,23 +49,22 @@ class HashingEmbedder:
 
 
 class ScriptedLLM:
-    """Dispatches on the stable system-prompt phrases listed in CLAUDE.md."""
+    """Dispatches on the stable system-prompt phrases listed in CLAUDE.md:
+    one input-screen call, one generator call (which also grades the
+    evidence), the document profile, and batched tag + enrich calls."""
 
     def __init__(self):
         self.user_prompts: list[str] = []
 
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict:
         self.user_prompts.append(user_prompt)
-        if "security classifier" in system_prompt:
-            return {"is_flagged": False}
-        if "query router" in system_prompt:
-            return {"route": "clause_lookup"}
-        if "enough to answer" in system_prompt:
-            return {"sufficiency": "sufficient"}
+        if "input screen" in system_prompt:
+            return {"is_flagged": False, "route": "clause_lookup"}
         if "legal contract analysis assistant" in system_prompt:
             for clause_id, text in _CLAUSE_HEADER.findall(user_prompt):
                 if _QUOTE in text:
                     return {
+                        "sufficiency": "sufficient",
                         "answer_text": "free text that must never be returned",
                         "claims": [
                             {
@@ -75,9 +74,15 @@ class ScriptedLLM:
                             }
                         ],
                     }
-            return {"answer_text": "Not addressed.", "claims": []}
-        if "context note" in system_prompt:  # merged tag + enrich call (R12)
-            return {"clause_type": "Other", "context_note": "Part of the Acme / Globex services agreement."}
+            return {"sufficiency": "insufficient", "answer_text": "Not addressed.", "claims": []}
+        if "context note" in system_prompt:  # batched tag + enrich call (R12)
+            labels = re.findall(r'<clause-[0-9a-f]+ id="(c\d+)">', user_prompt)
+            return {
+                "clauses": [
+                    {"id": label, "clause_type": "Other", "context_note": "Part of the Acme / Globex services agreement."}
+                    for label in labels
+                ]
+            }
         if "document-level metadata" in system_prompt:
             return {"summary": "Services agreement between Acme and Globex.", "governing_law": "Delaware"}
         return {"clause_type": "Other"}
@@ -159,7 +164,8 @@ def test_governing_law_filter_is_normalized_and_document_level(make_client):
     # "DE" -> "delaware" via the gazetteer, matching the normalized
     # document-level value stored on every clause.
     assert _query(client, governing_law="DE").json()["final_status"] == "answered"
-    assert _query(client, governing_law="California").json()["final_status"] == "flagged_for_review"
+    # Nothing passes the filter: a fixed "not found" statement (B11), no LLM call.
+    assert _query(client, governing_law="California").json()["final_status"] == "not_found"
 
 
 def test_unknown_document_is_404(make_client):
@@ -225,7 +231,7 @@ def test_flagged_query_is_queued_with_its_evidence_and_scoped_to_the_matter(make
     assert answered["query_id"] and answered["review_id"] is None
 
     flagged = _query(client, governing_law="California").json()
-    assert flagged["final_status"] == "flagged_for_review"
+    assert flagged["final_status"] == "not_found"  # still queued: a human confirms absence
     review_id = flagged["review_id"]
     assert review_id == flagged["query_id"]
 
@@ -271,3 +277,69 @@ def test_reviewer_decision_releases_only_a_revalidated_answer(make_client):
     assert decide(claim_text=_CLAIM, supporting_quote=_QUOTE).status_code == 409
     assert _reviews(client).json() == []  # no longer open
     assert [e.event_type for e in deps.audit_logger.events].count("review_decision") == 1
+
+
+# --- LLM call budget (fewer calls) ---
+
+
+def test_llm_call_budget_for_ingest_reingest_and_query(make_client):
+    """Ingest: 1 profile call + 1 per batch of 8 passages (was 1 + one per
+    passage). Re-ingesting identical text: 0 calls. An answered question:
+    2 calls -- input screen + generator (was 4: classifier, router,
+    sufficiency grader, generator)."""
+    client, deps = make_client()
+    body = _ingest(client).json()
+    ingest_calls = len(deps.llm_client.user_prompts)
+    assert ingest_calls == 1 + -(-body["num_clauses"] // 8)
+
+    assert _ingest(client).status_code == 200
+    assert len(deps.llm_client.user_prompts) == ingest_calls  # unchanged document: skipped
+
+    assert _query(client).json()["final_status"] == "answered"
+    assert len(deps.llm_client.user_prompts) == ingest_calls + 2
+
+
+def test_empty_document_is_422_not_500(make_client):
+    client, deps = make_client()
+    response = client.post(
+        "/documents/text",
+        json={"document_id": "empty-1", "tenant_id": "t-1", "matter_id": "m-1", "source_text": "   \n  "},
+    )
+    assert response.status_code == 422
+    assert deps.llm_client.user_prompts == []
+
+
+def test_upstream_llm_outage_is_503_with_retry_after(make_client):
+    from ingestion.metadata.llm_client import LLMCallError
+
+    class DownLLM(ScriptedLLM):
+        def generate_json(self, system_prompt, user_prompt):
+            raise LLMCallError("provider down")
+
+    client, deps = make_client()
+    _ingest(client)
+    deps.llm_client = DownLLM()
+    response = _query(client)
+    assert response.status_code == 503
+    assert response.headers["retry-after"]
+
+
+def test_crlf_contract_parses_like_lf(make_client):
+    """B17: CRLF text used to disable ALL-CAPS heading detection."""
+    client, _ = make_client()
+    lf = _ingest(client).json()["num_clauses"]
+    response = client.post(
+        "/documents/text",
+        json={"document_id": "msa-crlf", "tenant_id": "t-1", "matter_id": "m-1",
+              "source_text": CONTRACT.replace("\n", "\r\n")},
+    )
+    assert response.json()["num_clauses"] == lf
+
+
+def test_reviews_can_be_listed_across_all_statuses(make_client):
+    """L2: the status filter defaulted to open and None was unreachable."""
+    client, _ = make_client()
+    _ingest(client)
+    _query(client, governing_law="California")
+    assert len(_reviews(client, status="all").json()) == 1
+    assert _reviews(client, status="resolved").json() == []

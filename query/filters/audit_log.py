@@ -21,6 +21,9 @@ class AuditEvent(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     tenant_id: str | None = None
     matter_id: str | None = None
+    # Hashed credential id of the caller (app/dependencies.actor_id), so an
+    # event can be attributed without storing the key (review finding S7).
+    actor: str | None = None
     details: dict = Field(default_factory=dict)
 
 

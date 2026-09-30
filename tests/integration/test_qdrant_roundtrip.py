@@ -135,3 +135,43 @@ def test_reader_returns_clauses_in_document_order_with_defined_terms(stores):
 
     assert [c.text for c in context.clauses] == [f"clause {i}" for i in range(6)]
     assert [t.term for t in context.defined_terms] == ["Services"]
+
+
+def _versioned(doc, idx, text, version, tenant="tenant-1"):
+    tc = _tagged(doc, idx, text, tenant=tenant)
+    tc.metadata = tc.metadata.model_copy(update={"ingest_version": version})
+    return tc
+
+
+def test_reingest_writes_new_version_then_deletes_only_stale_points(stores):
+    """B15 against the real client: write v2 first, then delete every point
+    of the document that isn't v2 -- the v1 tail (clause-002) goes, the
+    other document and the other tenant's same-named document stay."""
+    indexer, _, reader = stores
+    indexer.upsert([_versioned("doc-1", i, f"v1 clause {i}", "v1") for i in range(3)])
+    indexer.upsert_references(
+        document_id="doc-1", tenant_id="tenant-1", matter_id="matter-1",
+        references=[SectionReference(source_clause_id="doc-1::clause-000", referenced_section_id="9", raw_text="Section 9")],
+        vector_dim=DIM, ingest_version="v1",
+    )
+    indexer.upsert([_versioned("doc-2", 0, "other doc", "v1")])
+    indexer.upsert([_versioned("doc-1", 0, "tenant 2 clause", "v1", tenant="tenant-2")])
+
+    indexer.upsert([_versioned("doc-1", i, f"v2 clause {i}", "v2") for i in range(2)])
+    indexer.delete_stale_versions(document_id="doc-1", tenant_id="tenant-1", matter_id="matter-1", keep_version="v2")
+
+    doc1 = reader.load_document("doc-1", tenant_id="tenant-1", matter_id="matter-1")
+    assert [c.text for c in doc1.clauses] == ["v2 clause 0", "v2 clause 1"]
+    assert doc1.references == []  # the v1 reference point went too
+    assert reader.load_document("doc-2", tenant_id="tenant-1", matter_id="matter-1").clauses
+    assert reader.load_document("doc-1", tenant_id="tenant-2", matter_id="matter-1").clauses
+
+
+def test_document_info_reports_privilege_and_version(stores):
+    indexer, _, _ = stores
+    assert indexer.document_info(document_id="doc-1", tenant_id="tenant-1", matter_id="matter-1") is None
+    tc = _versioned("doc-1", 0, "text", "v7")
+    tc.metadata = tc.metadata.model_copy(update={"privilege_level": "privileged"})
+    indexer.upsert([tc])
+    info = indexer.document_info(document_id="doc-1", tenant_id="tenant-1", matter_id="matter-1")
+    assert info == {"privilege_level": "privileged", "ingest_version": "v7"}

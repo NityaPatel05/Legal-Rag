@@ -2,7 +2,8 @@
 only validated claims reach the user, regeneration uses validator feedback,
 and the router's decision actually changes behavior."""
 
-from query.generation.crag_graph import _route_after_sufficiency, run_crag
+from query.generation.answer_generator import AnswerGenerationResult, Sufficiency
+from query.generation.crag_graph import _route_after_generate, run_crag
 from query.schemas import (
     JailbreakClassification,
     PermissionContext,
@@ -32,8 +33,10 @@ def _shown(*clauses):
 
 
 class SequencedLLM:
-    """Scripted responses per call kind, consumed in order; the last one
-    repeats. Records the user prompts sent to the generator."""
+    """Scripted generator responses, consumed in order; the last one
+    repeats. The evidence grade now comes back in the SAME response
+    (answer_generator.py), so `sufficiency` is folded into each generator
+    response. Records the user prompts sent to the generator."""
 
     def __init__(self, *, sufficiency, generate):
         self._sufficiency = list(sufficiency)
@@ -43,9 +46,9 @@ class SequencedLLM:
     def generate_json(self, system_prompt, user_prompt):
         if "legal contract analysis assistant" in system_prompt:
             self.generate_prompts.append(user_prompt)
-            return self._generate.pop(0) if len(self._generate) > 1 else self._generate[0]
-        if "enough to answer" in system_prompt:
-            return self._sufficiency.pop(0) if len(self._sufficiency) > 1 else self._sufficiency[0]
+            response = self._generate.pop(0) if len(self._generate) > 1 else self._generate[0]
+            grade = self._sufficiency.pop(0) if len(self._sufficiency) > 1 else self._sufficiency[0]
+            return {**grade, **response}
         raise AssertionError(f"unexpected prompt: {system_prompt[:60]}")
 
 
@@ -147,14 +150,15 @@ def test_uncited_answer_is_flagged_not_answered():
 
 
 def test_contradiction_check_route_proceeds_on_ambiguous():
+    answer = AnswerGenerationResult(answer_text="", claims=[], sufficiency=Sufficiency.AMBIGUOUS)
     assert (
-        _route_after_sufficiency(
-            {"sufficiency": "ambiguous", "retry_count": 0, "route": RouteType.CONTRADICTION_CHECK.value}
+        _route_after_generate(
+            {"answer": answer, "retry_count": 0, "route": RouteType.CONTRADICTION_CHECK.value}
         )
-        == "generate"
+        == "validate_citations"
     )
     assert (
-        _route_after_sufficiency({"sufficiency": "ambiguous", "retry_count": 0, "route": "clause_lookup"})
+        _route_after_generate({"answer": answer, "retry_count": 0, "route": "clause_lookup"})
         == "flag_for_review"
     )
 

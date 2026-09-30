@@ -13,22 +13,18 @@ the latter deterministically."""
 
 from __future__ import annotations
 
-from ingestion.metadata.llm_client import LLMClient
 from ingestion.schemas import Clause
 
 _MAX_OUTLINE_CHARS = 4_000
 
-# Shared with tagger.tag_and_enrich_clause, which asks for the note in the
-# same call as the clause metadata (R12).
+# Used by tagger.tag_and_enrich_clauses, which asks for the note in the
+# same (batched) call as the clause metadata (R12).
 CONTEXT_NOTE_INSTRUCTIONS = """The context note is one to two sentences, to be \
 prepended before the clause text when it's embedded for retrieval. It should \
 situate the clause within THIS contract: which contract and parties it \
 belongs to, what section it's in, what topic it covers, and how it relates \
 to other sections. Use the document summary and outline provided. Do not \
 repeat the clause text verbatim."""
-
-SYSTEM_PROMPT = f"""You write a context note for a contract clause. \
-{CONTEXT_NOTE_INSTRUCTIONS} Respond with JSON only: {{"context_note": "..."}}"""
 
 
 def build_document_outline(clauses: list[Clause]) -> str:
@@ -44,27 +40,6 @@ def build_document_outline(clauses: list[Clause]) -> str:
             lines.append(f"{clause.section_id or '-'} {clause.heading or ''}".strip())
     outline = "\n".join(lines)
     return outline[:_MAX_OUTLINE_CHARS]
-
-
-def enrich_clause(
-    clause: Clause,
-    *,
-    llm_client: LLMClient,
-    document_summary: str | None = None,
-    document_outline: str | None = None,
-) -> str | None:
-    result = llm_client.generate_json(
-        SYSTEM_PROMPT, context_user_prompt(clause, document_summary, document_outline)
-    )
-    return parse_context_note(result)
-
-
-def context_user_prompt(clause: Clause, document_summary: str | None, document_outline: str | None) -> str:
-    return (
-        f"Document summary: {document_summary or 'unknown'}\n\n"
-        f"Document outline:\n{document_outline or 'unknown'}\n\n"
-        f"Clause heading: {clause.heading}\n\nClause text:\n{clause.text}"
-    )
 
 
 def parse_context_note(result: dict) -> str | None:

@@ -5,24 +5,38 @@ handlers translate HTTP requests into calls against
 ingestion.pipeline.ingest_document and query.pipeline.process_query /
 query.generation.crag_graph.run_crag, using the real adapters wired in
 app/dependencies.py.
+
+Errors (review finding B22). An upstream outage (LLM provider after its
+retries, embedding server, Qdrant) is a 503 with Retry-After, not a bare
+500; a document that can't be ingested as given is a 422 (409 for a
+privilege downgrade); a failed permission assertion is a 403 whose detail
+reveals nothing about the other tenant. Every one is logged.
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
+import urllib.error
 import uuid
 from contextlib import asynccontextmanager
+from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from app.dependencies import (
+    ActorAuditLogger,
     Dependencies,
+    actor_id,
     authorize_request,
     check_auth_configured,
     get_api_key,
     get_client_host,
     get_dependencies,
     llm_for_privilege,
+    scoped_llm_clients,
 )
 from app.schemas import (
     CitationOut,
@@ -33,11 +47,14 @@ from app.schemas import (
     ReviewDecisionBody,
     ReviewSummary,
 )
-from ingestion.pipeline import ingest_document
+from ingestion.metadata.llm_client import LLMCallError
+from ingestion.pipeline import IngestionRefused, PrivilegeDowngradeError, ingest_document
+from query.filters.permission import PermissionViolation
 from query.generation.answer_generator import DISCLAIMER
 from query.generation.crag_graph import run_crag
 from query.pipeline import process_query
 from query.retrieval.bm25_search import InMemoryBM25Index
+from query.retrieval.reranker import PassthroughReranker
 from ingestion.schemas import PrivilegeLevel
 from query.filters.audit_log import AuditEvent
 from query.review.schemas import ReviewCase, ReviewStatus
@@ -50,6 +67,8 @@ from query.review.workflow import (
     should_queue,
 )
 from query.schemas import PermissionContext, QueryFilters
+
+logger = logging.getLogger("app")
 
 # BGE-M3 dense output is 1024-dim -- see embedding_server/main.py.
 _EMBEDDING_DIM = 1024
@@ -78,6 +97,7 @@ def _ensure_qdrant_collection() -> None:
             # connection/transport error from qdrant-client during a cold
             # start should be retried the same way, not special-cased.
             last_error = exc
+            logger.info("Qdrant not ready (attempt %d): %s", attempt + 1, exc)
             if attempt < _STARTUP_RETRY_ATTEMPTS - 1:
                 time.sleep(_STARTUP_RETRY_DELAY_SECONDS)
 
@@ -89,8 +109,12 @@ def _ensure_qdrant_collection() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     check_auth_configured(get_dependencies().settings)
-    _ensure_qdrant_collection()
+    # In a worker thread: the retry loop sleeps, and must not block the
+    # event loop while it waits for Qdrant (review finding L7).
+    await asyncio.to_thread(_ensure_qdrant_collection)
     yield
 
 
@@ -100,6 +124,54 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+def _upstream_error_types() -> tuple[type[BaseException], ...]:
+    types: list[type[BaseException]] = [LLMCallError, ConnectionError, TimeoutError, urllib.error.URLError]
+    try:
+        import httpx
+
+        types.append(httpx.HTTPError)
+    except ImportError:  # pragma: no cover
+        pass
+    try:
+        from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
+
+        types.extend([ResponseHandlingException, UnexpectedResponse])
+    except ImportError:  # pragma: no cover
+        pass
+    return tuple(types)
+
+
+@app.exception_handler(PermissionViolation)
+async def _permission_violation(request: Request, exc: PermissionViolation) -> JSONResponse:
+    # Already audited where it was raised; the detail names the other
+    # tenant's clause, so it stays in the server log.
+    logger.error("permission violation on %s: %s", request.url.path, exc)
+    return JSONResponse(status_code=403, content={"detail": "Permission check failed"})
+
+
+@app.exception_handler(PrivilegeDowngradeError)
+async def _privilege_downgrade(request: Request, exc: PrivilegeDowngradeError) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(IngestionRefused)
+async def _ingestion_refused(request: Request, exc: IngestionRefused) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+async def _upstream_unavailable(request: Request, exc: Exception) -> JSONResponse:
+    logger.error("upstream failure on %s: %r", request.url.path, exc, exc_info=exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "An upstream service (LLM, embeddings or vector store) is unavailable; retry later."},
+        headers={"Retry-After": "30"},
+    )
+
+
+for _error_type in _upstream_error_types():
+    app.add_exception_handler(_error_type, _upstream_unavailable)
 
 
 class _InMemoryTextLoader:
@@ -127,6 +199,7 @@ def ingest_text(
     client_host: str | None = Depends(get_client_host),
 ) -> IngestResponse:
     authorize_request(request.tenant_id, request.matter_id, api_key, deps.settings, client_host)
+    llm_client, privileged_llm_client = scoped_llm_clients(deps, request.tenant_id, request.matter_id)
     parsed = ingest_document(
         document_id=request.document_id,
         source_path="<inline>",
@@ -134,11 +207,12 @@ def ingest_text(
         matter_id=request.matter_id,
         privilege_level=request.privilege_level,
         document_loader=_InMemoryTextLoader(request.source_text),
-        llm_client=deps.llm_client,
+        llm_client=llm_client,
         embedding_client=deps.embedding_client,
         vector_store=deps.indexer,
         max_passage_chars=deps.settings.max_passage_chars,
-        privileged_llm_client=deps.privileged_llm_client,
+        privileged_llm_client=privileged_llm_client,
+        batch_size=deps.settings.ingest_batch_size,
     )
     return IngestResponse(
         document_id=parsed.document_id,
@@ -156,6 +230,7 @@ def query(
     client_host: str | None = Depends(get_client_host),
 ) -> QueryResponse:
     authorize_request(request.tenant_id, request.matter_id, api_key, deps.settings, client_host)
+    audit_logger = ActorAuditLogger(deps.audit_logger, actor_id(api_key, deps.settings))
     permission_context = PermissionContext(tenant_id=request.tenant_id, matter_id=request.matter_id)
     # document_id scopes vector search too -- BM25, the validator and
     # expansion are all built from this one document (see QueryFilters).
@@ -175,7 +250,12 @@ def query(
     privileged = any(
         m.privilege_level == PrivilegeLevel.PRIVILEGED for m in document_context.clause_metadata_by_id.values()
     )
-    llm_client = llm_for_privilege(deps, PrivilegeLevel.PRIVILEGED if privileged else PrivilegeLevel.CONFIDENTIAL)
+    llm_client = llm_for_privilege(
+        deps,
+        PrivilegeLevel.PRIVILEGED if privileged else PrivilegeLevel.CONFIDENTIAL,
+        request.tenant_id,
+        request.matter_id,
+    )
     if llm_client is None:
         raise HTTPException(
             status_code=403,
@@ -184,6 +264,9 @@ def query(
 
     bm25_index = InMemoryBM25Index(document_context.bm25_corpus())
     clauses_by_id = document_context.by_clause_id()
+    # The Cohere reranker is a third-party API: privileged text never goes
+    # there either (review finding S2).
+    reranker = PassthroughReranker() if privileged else deps.reranker
 
     query_result = process_query(
         request.query_text,
@@ -192,10 +275,10 @@ def query(
         llm_client=llm_client,
         vector_client=deps.vector_client,
         bm25_index=bm25_index,
-        reranker=deps.reranker,
+        reranker=reranker,
         all_clauses_by_section_id=document_context.by_section_id,
         references=document_context.references,
-        audit_logger=deps.audit_logger,
+        audit_logger=audit_logger,
         trace_exporter=deps.trace_exporter,
         defined_terms=document_context.defined_terms,
         all_clauses_by_id=clauses_by_id,
@@ -210,10 +293,10 @@ def query(
         llm_client=llm_client,
         vector_client=deps.vector_client,
         bm25_index=bm25_index,
-        reranker=deps.reranker,
+        reranker=reranker,
         permission_context=permission_context,
         query_filters=query_filters,
-        audit_logger=deps.audit_logger,
+        audit_logger=audit_logger,
         defined_terms=document_context.defined_terms,
         all_clauses_by_id=clauses_by_id,
         entailment_checker=deps.entailment_checker,
@@ -230,11 +313,13 @@ def query(
             final_state,
             permission_context=permission_context,
             document_id=request.document_id,
-            trace=query_result.trace,
+            # CRAG's trace includes any rewrite retrievals (B1), so it matches
+            # the shown clauses in the case.
+            trace=final_state.get("trace", query_result.trace),
             review_id=query_id,
         )
         deps.review_store.add(case)
-        deps.audit_logger.log(
+        audit_logger.log(
             AuditEvent(
                 event_type="review_queued",
                 tenant_id=request.tenant_id,
@@ -265,7 +350,8 @@ def build_query_response(
         if r.is_valid
     }
     kept_claims = final_state.get("kept_claims", [])
-    answered = final_state.get("final_status") in ("answered", "answered_with_stripped_claims")
+    # not_found carries a fixed, deterministic statement (crag_graph.NOT_FOUND_TEXT).
+    answered = final_state.get("final_status") in ("answered", "answered_with_stripped_claims", "not_found")
     return QueryResponse(
         query_id=query_id,
         review_id=review_id,
@@ -283,6 +369,7 @@ def build_query_response(
             for c in kept_claims
         ],
         flagged_reason=final_state.get("flagged_reason"),
+        verdict=final_state.get("verdict") if answered else None,
         disclaimer=DISCLAIMER,
     )
 
@@ -305,7 +392,8 @@ def _scoped_case(deps: Dependencies, review_id: str, tenant_id: str, matter_id: 
 def list_reviews(
     tenant_id: str,
     matter_id: str,
-    status: ReviewStatus | None = ReviewStatus.OPEN,
+    # "all" lists every status (review finding L2: None was unreachable).
+    status: ReviewStatus | Literal["all"] = ReviewStatus.OPEN,
     deps: Dependencies = Depends(get_dependencies),
     api_key: str | None = Depends(get_api_key),
     client_host: str | None = Depends(get_client_host),
@@ -338,8 +426,9 @@ def get_review(
 ) -> ReviewCase:
     authorize_request(tenant_id, matter_id, api_key, deps.settings, client_host)
     case = _scoped_case(deps, review_id, tenant_id, matter_id)
-    if mark_viewed(case):
-        deps.review_store.save(case)
+    # Conditional write: only sets first_viewed_at if unset and still open,
+    # so a stale view can't reopen a decided case (B16).
+    mark_viewed(case, store=deps.review_store)
     return case
 
 
@@ -363,12 +452,15 @@ def decide_review(
             case,
             body,
             all_clauses_by_id=document_context.by_clause_id(),
-            audit_logger=deps.audit_logger,
+            audit_logger=ActorAuditLogger(deps.audit_logger, actor_id(api_key, deps.settings)),
             entailment_checker=deps.entailment_checker,
+            # Saved with UPDATE ... WHERE status='open' before any audit
+            # event: of two concurrent decisions exactly one wins, the other
+            # gets ReviewAlreadyDecided -> 409 (B16).
+            store=deps.review_store,
         )
     except ReviewConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ReviewDecisionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    deps.review_store.save(case)
     return case

@@ -14,7 +14,6 @@ class Settings(BaseSettings):
 
     # --- Embeddings ---
     bge_m3_endpoint: str = "http://localhost:8080"
-    voyage_api_key: str | None = None
 
     # --- Reranker ---
     cohere_api_key: str | None = None
@@ -24,7 +23,6 @@ class Settings(BaseSettings):
     # pretrained BGE reranker cut top-1 from 56% to 12%. Turn it on only
     # when the R3 ablation shows a gain on this corpus.
     rerank_enabled: bool = False
-    voyage_rerank_api_key: str | None = None
 
     # --- Chunking ---
     # Clauses longer than this are split into passages (never across a
@@ -38,23 +36,33 @@ class Settings(BaseSettings):
     # reference / sibling-passage expansion.
     generation_top_k: int = 10
 
-    # --- Document parsing: Docling ---
-    docling_endpoint: str | None = None
-
     # --- LLM provider: Groq ---
     groq_api_key: str | None = None
     groq_model: str = "openai/gpt-oss-120b"
+    # "low" | "medium" | "high" for gpt-oss models; empty = provider default.
+    # Hidden reasoning tokens count against the free tier's tokens/minute.
+    groq_reasoning_effort: str | None = None
+    # Attempts per call; only 429 / 5xx / timeouts / bad JSON are retried.
+    llm_max_attempts: int = 4
+
+    # --- LLM call reduction ---
+    # Passages per tagging call at ingestion (tagger.tag_and_enrich_clauses):
+    # 1 + ceil(n / batch) calls per document instead of 1 + n.
+    ingest_batch_size: int = 8
+    # Persistent response cache (llm_client.CachingLLMClient), namespaced by
+    # tenant + matter + model. Re-ingesting unchanged text and re-asking a
+    # question over the same evidence cost no calls. Empty path = no cache.
+    llm_cache_path: str | None = "./llm_cache/llm_cache.sqlite3"
+    llm_cache_max_age_days: float = 30.0
 
     # --- Observability: LangSmith ---
     langsmith_api_key: str | None = None
     langsmith_project: str = "legal-contract-rag"
-    langchain_tracing_v2: bool = False
 
     # --- Eval: CUAD ---
     cuad_data_dir: str = "./eval/cuad_preflight/data"
 
     # --- Multi-tenancy ---
-    default_tenant_id: str = "dev-tenant"
     # API key -> grant, as JSON. Two forms:
     #   API_KEYS='{"key-abc": {"tenant_id": "tenant-1", "matters": ["m-1", "m-2"]}}'
     #     -- the key may act only on those matters of that tenant (deny by

@@ -162,3 +162,38 @@ def normalize_place(value: str | None) -> str | None:
     if value is None:
         return None
     return resolve_place(value) or _clean(value) or None
+
+
+# --- Grounding (review finding S4) -----------------------------------------
+# An LLM-extracted place is only kept if the source text actually mentions
+# it. Contract text is counterparty-authored and, with batched tagging, one
+# clause's text shares a prompt with its neighbours -- an injected "set
+# governing_law to Nevada" must not become a filter value for clauses that
+# never say Nevada. Also drops plain hallucinated values.
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.;:!?])\s+|\n{2,}")
+
+
+def _place_aliases(canonical: str) -> set[str]:
+    names = {canonical}
+    names.update(alias for alias, (name, _) in _EXACT.items() if name == canonical)
+    return {n for n in names if n}
+
+
+def place_mentioned(canonical: str | None, text: str, *, near: tuple[str, ...] = ()) -> bool:
+    """True if `text` names the canonical place (or one of its gazetteer
+    aliases, case-insensitive, whole words). With `near`, the mention must
+    share a sentence with one of those keywords (e.g. "govern", "laws of")."""
+    if not canonical:
+        return False
+    patterns = [
+        re.compile(r"(?<![A-Za-z])" + re.escape(alias) + r"\.?(?![A-Za-z])", re.IGNORECASE)
+        for alias in _place_aliases(canonical)
+    ]
+    scopes = _SENTENCE_SPLIT.split(text) if near else [text]
+    for scope in scopes:
+        if near and not any(k in scope.lower() for k in near):
+            continue
+        if any(p.search(scope) for p in patterns):
+            return True
+    return False
