@@ -44,6 +44,29 @@ roman-numeral or "(a)" schemes -- the next bucket to look at); 14 do but
 fail the sequence/threshold guards. Report:
 eval/cuad_preflight/reports/chunk_quality_r13.json.
 
+Fourth pass (review B7/B17) hardened line-level detection against false
+headings, which are worse than missed ones: a false "3" shadows the real
+Section 3 in build_section_lookup (duplicate ids are dropped as ambiguous).
+- Wrapped lines: PDF text wraps mid-sentence, so "...as set forth in\n
+  Section 3 hereof." or "...within\n30 Business Days" matched exactly. A
+  line-level heading now needs the previous line to be blank, end in
+  terminal punctuation, be an accepted heading, or be a short Title Case
+  line (_starts_block). CUAD is unaffected by this guard -- every one of its
+  ~15.5k line-level matches follows a blank line -- so it is covered by
+  tests, not by the corpus.
+- Numbering: a line-level number must plausibly continue its series
+  (_plausible_numbering; looser than the inline pass's _in_sequence because
+  exhibits restart, TOCs precede bodies and flattened docs expose only a
+  sparse 8, 10, 12, 14 at line start). On CUAD: 143 line headings dropped
+  (sampled: mostly table rows -- "12 Months", "5 Voicetones" -- and numbered
+  list items; a few extraction-order oddities), duplicate section ids
+  1,484 -> 1,393, docs at <=2 clauses unchanged at 53, clause-level
+  containment 99.72% -> 99.73%, 1000-char passages 95.20% -> 95.21%.
+- Invisible characters: detection runs on normalize_preserving_offsets(raw)
+  so CRLF, NBSP, form feeds and zero-width characters no longer hide a
+  heading (text_normalize.py). CUAD's text is already clean except en/em
+  spaces: 1 doc gains 18 headings ("6.<EM SPACE>ENVIRONMENTAL COVENANTS").
+
 ALL-CAPS false-positive risk is real, not hypothetical: sampling actual
 matches turned up document titles, "EXHIBIT 10.6"-style stubs, and signatory
 names in all caps alongside genuine headings like "DEFINITIONS". Mitigated,
@@ -69,6 +92,7 @@ from __future__ import annotations
 
 import re
 
+from ingestion.parsing.text_normalize import normalize_preserving_offsets
 from ingestion.schemas import Clause
 
 _HEADING_TERMINATOR = r"(?:\.(?=[ \t]+[A-Z])|$)"
@@ -103,26 +127,164 @@ _LETTERED_HEADING = re.compile(
 def _find_headings(raw_text: str) -> list[tuple[int, str | None, str | None]]:
     """Returns (start_offset, section_id, heading) tuples sorted by position,
     deduped so a line only ever matches once even if multiple patterns could
-    fire — priority order is captioned > numbered > ALL-CAPS > lettered,
-    most to least confident pattern."""
-    matches: dict[int, tuple[str | None, str | None]] = {}
+    fire -- priority order is captioned > numbered > ALL-CAPS > lettered,
+    most to least confident pattern. Line-level candidates must then pass
+    the wrapped-line guard (_starts_block) and numbered ones the numbering
+    guard (_plausible_numbering); see the module docstring."""
+    candidates: dict[int, tuple[str, str | None, str | None]] = {}
     for m in _CAPTIONED_HEADING.finditer(raw_text):
-        matches[m.start()] = (m.group("num"), m.group("heading").strip() or None)
+        series = _ARTICLE if m.group("kind").upper() == "ARTICLE" else _SECTION
+        candidates[m.start()] = (series, m.group("num"), m.group("heading").strip() or None)
     for m in _NUMBERED_HEADING.finditer(raw_text):
-        matches.setdefault(m.start(), (m.group("num"), m.group("heading").strip() or None))
+        candidates.setdefault(m.start(), (_SECTION, m.group("num"), m.group("heading").strip() or None))
     for m in _ALLCAPS_HEADING.finditer(raw_text):
         heading = m.group("heading").strip()
         if m.start() == 0 or _ALLCAPS_BLOCKLIST.match(heading):
             continue
-        matches.setdefault(m.start(), (None, heading))
+        candidates.setdefault(m.start(), (_ALLCAPS, None, heading))
     for m in _LETTERED_HEADING.finditer(raw_text):
         # No section_id -- see module docstring on why a bare letter can't
         # safely be used as a citation-lookup key.
-        matches.setdefault(m.start(), (None, m.group("heading").strip() or None))
+        candidates.setdefault(m.start(), (_LETTERED, None, m.group("heading").strip() or None))
+
+    accepted: dict[int, str] = {}
+    for offset in sorted(candidates):
+        if _starts_block(raw_text, offset, candidates[offset][0], accepted):
+            accepted[offset] = candidates[offset][0]
+    survivors = [(offset, *candidates[offset]) for offset in sorted(accepted)]
+
+    matches: dict[int, tuple[str | None, str | None]] = {}
+    for offset, sec_id, heading in _plausible_numbering(survivors):
+        matches[offset] = (sec_id, heading)
     if len(matches) < _MIN_LINE_HEADINGS:
         for offset, sec_id, heading in _find_inline_headings(raw_text):
             matches.setdefault(offset, (sec_id, heading))
     return [(offset, sec_id, heading) for offset, (sec_id, heading) in sorted(matches.items())]
+
+
+# Candidate kinds. ARTICLE and SECTION (captioned "Section N" and bare "N.")
+# are the two numbering series; the other two carry no number.
+_ARTICLE, _SECTION, _ALLCAPS, _LETTERED = "ARTICLE", "SECTION", "ALLCAPS", "LETTERED"
+
+# A line ends a sentence (or a caption / list item) if its last visible
+# character is terminal punctuation, optionally followed by closing quotes,
+# brackets or parentheses: 'Services.', 'as follows:', '(each, a "Party").'
+_TERMINAL_LINE_END = re.compile(r"[.:;?!][\"'”’)\]]*$")
+# A short Title Case line without terminal punctuation ("Termination",
+# "Limitation of Liability", "ARTICLE 12") is an unmatched heading of its
+# own, e.g. "Termination\n12.1 Either party may ...". A wrapped prose line
+# ends mid-sentence and fails this: it is long, or has a lowercase word
+# ("... as set forth in", "... shall pay the Company").
+_TITLE_WORD = re.compile(r"[A-Za-z][A-Za-z'’\-]*")
+_MAX_TITLE_LINE = 60
+
+
+def _previous_line(text: str, offset: int) -> tuple[int, str] | None:
+    """(start, text) of the line before the one starting at offset, or None
+    when offset is on the first line."""
+    if offset == 0:
+        return None
+    end = offset - 1  # the "\n" that ends the previous line
+    start = text.rfind("\n", 0, end) + 1
+    return start, text[start:end]
+
+
+def _is_title_line(line: str) -> bool:
+    if len(line) > _MAX_TITLE_LINE or not (line[0].isupper() or line[0].isdigit()):
+        return False
+    return all(word[0].isupper() for word in _TITLE_WORD.findall(line) if len(word) > 3)
+
+
+def _starts_block(text: str, offset: int, kind: str, accepted: dict[int, str]) -> bool:
+    """The wrapped-line guard: a line-level heading must start a new block.
+    Text extracted from PDFs wraps sentences at a fixed width, so a
+    continuation line can begin "Section 3 hereof." or "30 Business Days"
+    and match a heading pattern exactly. Accept the line only if it is the
+    first line, or the previous line is blank, ends in terminal punctuation,
+    is itself an accepted heading line, or (numbered / captioned / lettered
+    only) is a short Title Case line -- an unmatched heading such as
+    "Termination" above "12.1 Either party ...".
+
+    ALL-CAPS candidates don't get the Title Case exemption, and count a
+    previous heading only if it was numbered or captioned ("ARTICLE 1" over
+    "DEFINITIONS"): otherwise every line of a wrapped ALL-CAPS disclaimer
+    ("IN NO EVENT SHALL EITHER PARTY BE LIABLE" / "FOR ANY INDIRECT ...")
+    would chain from the one before it."""
+    prev = _previous_line(text, offset)
+    if prev is None:
+        return True
+    prev_start, prev_text = prev
+    stripped = prev_text.strip()
+    if not stripped or _TERMINAL_LINE_END.search(stripped):
+        return True
+    prev_kind = accepted.get(prev_start)
+    if kind == _ALLCAPS:
+        return prev_kind in (_ARTICLE, _SECTION)
+    return prev_kind is not None or _is_title_line(stripped)
+
+
+# How far line-level numbering may jump forward without the next number
+# confirming it. Sparse-but-increasing sequences are normal: in flattened
+# CUAD documents only the headings after a page break sit at line start
+# (8, 10, 12, 14, 19), the rest are found by the inline pass.
+_MAX_SECTION_GAP = 5
+
+
+def _as_number(section_id: str | None) -> tuple[int, ...] | None:
+    if section_id is None or not section_id[0].isdigit():
+        return None  # roman numerals: not sequenced
+    return tuple(int(part) for part in section_id.split("."))
+
+
+def _plausible_next(
+    last: tuple[int, ...], number: tuple[int, ...], following: tuple[int, ...] | None
+) -> bool:
+    """Looser than _in_sequence (which guards the noisier inline pass). A
+    restart at 1 is always fine (exhibits and schedules restart numbering),
+    and so is any step back that the next number continues in sequence (a
+    table of contents ending at 13.18, then the body's 2.1, 2.2, ...).
+    Otherwise the number must go forward, must not be contradicted by the
+    next number landing between the last one and it ("2 ... 30 Business
+    Days ... 3": 3 fits, 30 doesn't), and a jump of more than
+    _MAX_SECTION_GAP needs the next number to follow it closely
+    (4 -> 9 -> 10) unless it is the last number of its series."""
+    if number[0] == 1:
+        return True
+    if number <= last:
+        return following is not None and _in_sequence(number, following)
+    if following is not None and last < following < number:
+        return False
+    if number[0] - last[0] <= _MAX_SECTION_GAP or following is None:
+        return True
+    return number < following and following[0] - number[0] <= _MAX_SECTION_GAP
+
+
+def _plausible_numbering(
+    survivors: list[tuple[int, str, str | None, str | None]],
+) -> list[tuple[int, str | None, str | None]]:
+    """The numbering guard for line-level headings (see _plausible_next),
+    kept per series: ARTICLE numbers vs Section / bare numbers, which often
+    restart inside each article. A rejected number doesn't move the series
+    forward, so one stray number can't derail the rest of the document."""
+    numbers = [_as_number(sec_id) if kind in (_ARTICLE, _SECTION) else None for _, kind, sec_id, _ in survivors]
+    next_in_series: list[tuple[int, ...] | None] = [None] * len(survivors)
+    upcoming: dict[str, tuple[int, ...]] = {}
+    for i in range(len(survivors) - 1, -1, -1):
+        kind = survivors[i][1]
+        next_in_series[i] = upcoming.get(kind)
+        if numbers[i] is not None:
+            upcoming[kind] = numbers[i]
+
+    kept: list[tuple[int, str | None, str | None]] = []
+    last: dict[str, tuple[int, ...]] = {}
+    for i, (offset, kind, sec_id, heading) in enumerate(survivors):
+        number = numbers[i]
+        if number is not None:
+            if not _plausible_next(last.get(kind, (0,)), number, next_in_series[i]):
+                continue
+            last[kind] = number
+        kept.append((offset, sec_id, heading))
+    return kept
 
 
 # Flattened text (newlines lost in extraction): headings sit mid-line, e.g.
@@ -168,8 +330,15 @@ def _in_sequence(last: tuple[int, ...], number: tuple[int, ...]) -> bool:
 def parse_clauses(raw_text: str, *, document_id: str) -> list[Clause]:
     """Splits raw_text into clause-level chunks. If no headings are detected,
     the whole document is returned as a single clause rather than guessing at
-    boundaries."""
-    headings = _find_headings(raw_text)
+    boundaries.
+
+    Headings are detected on normalize_preserving_offsets(raw_text) -- CRLF,
+    NBSP, form feeds and zero-width characters no longer defeat the
+    patterns -- but clause text and offsets always index raw_text itself,
+    so clause.text == raw_text[start_offset:end_offset] for any caller. The
+    ingestion pipeline stores normalize_source_text(raw) and parses that
+    (text_normalize.py explains why there are two functions)."""
+    headings = _find_headings(normalize_preserving_offsets(raw_text))
     boundaries = [offset for offset, _, _ in headings] + [len(raw_text)]
 
     clauses: list[Clause] = []
@@ -222,6 +391,10 @@ def parse_clauses(raw_text: str, *, document_id: str) -> list[Clause]:
 # The numbers quoted above (and R13's chunk-quality report) were measured at
 # 2000 chars.
 DEFAULT_MAX_PASSAGE_CHARS = 1000
+# Below this a "passage" is a sentence fragment, so a smaller value is a
+# configuration error. (max_chars < 4 used to make _pack loop forever:
+# max_chars // 4 == 0 admitted a cut at the window's own start.)
+MIN_PASSAGE_CHARS = 200
 
 _PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
 _SENTENCE_END = re.compile(r"(?<=[.;:])\s+(?=[A-Z(\"“])")
@@ -247,6 +420,8 @@ def _pack(text: str, cut_tiers: list[list[int]], max_chars: int) -> list[tuple[i
             if usable:
                 end = max(usable)
                 break
+        if end <= start:  # unreachable for max_chars >= 1; never spin
+            raise RuntimeError(f"passage packing made no progress at offset {start}")
         windows.append((start, end))
         start = end
     windows.append((start, len(text)))
@@ -260,7 +435,13 @@ def split_oversize_clauses(
     preferring paragraph breaks, then sentence ends. Passages keep the
     parent's section_id and heading, carry parent_clause_id, and are
     sub-ranges of the parent -- so the no-straddle invariant still holds.
-    Clauses at or under the limit pass through unchanged."""
+    Clauses at or under the limit pass through unchanged. Raises ValueError
+    for max_chars < MIN_PASSAGE_CHARS."""
+    if max_chars < MIN_PASSAGE_CHARS:
+        raise ValueError(
+            f"max_chars={max_chars} is below MIN_PASSAGE_CHARS={MIN_PASSAGE_CHARS}: passages "
+            f"that small are sentence fragments (default is {DEFAULT_MAX_PASSAGE_CHARS})"
+        )
     out: list[Clause] = []
     for clause in clauses:
         if len(clause.text) <= max_chars:

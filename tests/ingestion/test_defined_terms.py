@@ -34,3 +34,38 @@ def test_multiple_defined_terms_in_one_clause():
     terms = extract_defined_terms(clauses)
     term_names = {t.term for t in terms}
     assert term_names == {"Buyer", "Seller"}
+
+
+# --- L6: abbreviation periods don't end a definition ---
+
+
+def _definitions(text: str) -> dict[str, str]:
+    return {t.term: t.definition for t in extract_defined_terms(parse_clauses(text, document_id="d"))}
+
+
+def test_definition_is_not_cut_at_a_company_suffix():
+    defs = _definitions('1. Definitions\n\n"Licensor" means Acme Holdings, Inc. and its Affiliates. Other text.')
+    assert defs["Licensor"] == "Acme Holdings, Inc. and its Affiliates"
+
+
+def test_definition_is_not_cut_at_eg_or_ie():
+    defs = _definitions(
+        '1. Definitions\n\n"Products" means goods, e.g. Widgets and Gadgets, i.e. Hardware sold hereunder. Next.'
+    )
+    assert defs["Products"] == "goods, e.g. Widgets and Gadgets, i.e. Hardware sold hereunder"
+
+
+def test_definition_keeps_us_and_no_abbreviations():
+    defs = _definitions('1. Definitions\n\n"Dollars" means U.S. Dollars under Order No. 5 of the Plan. Next.')
+    assert defs["Dollars"] == "U.S. Dollars under Order No. 5 of the Plan"
+
+
+def test_company_suffix_before_the_next_definition_still_ends_it():
+    defs = _definitions('1. Definitions\n\n"Buyer" means Acme Corp. "Seller" means Globex Ltd. The rest.')
+    assert defs == {"Buyer": "Acme Corp", "Seller": "Globex Ltd"}
+
+
+def test_parenthetical_definition_after_a_company_suffix_keeps_the_name():
+    defs = _definitions('1. Parties\n\nThis Agreement is between Acme Corp. (the "Company") and Globex, Inc. ("Globex").')
+    assert defs["Company"] == "This Agreement is between Acme Corp."
+    assert defs["Globex"].endswith("and Globex, Inc.")

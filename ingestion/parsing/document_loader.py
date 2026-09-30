@@ -1,5 +1,33 @@
+"""Document loaders: turn a source file into the plain text clause_parser
+segments.
+
+Docling's export is Markdown, not plain text: headings come out as
+"## 1. Services" or "**1. Services**", and no clause_parser pattern matches
+a line that starts with "#" or "*" -- so every Docling-loaded contract parsed
+as ONE clause (preamble only), silently. DoclingLoader therefore strips the
+heading markup (strip_markdown_heading_markup) before returning. Only markup
+that sits at the start of a line is touched: bold inside body text is left
+as-is, since stored text is what citations are matched against and the
+model sees the same text. Markdown tables are out of scope."""
+
+import re
 from pathlib import Path
 from typing import Protocol
+
+# ATX heading: up to 3 spaces of indent, 1-6 "#", whitespace, the text, and
+# an optional closing run of "#".
+_ATX_HEADING = re.compile(r"^[ ]{0,3}#{1,6}[ \t]+(?P<text>.*?)(?:[ \t]+#+)?[ \t]*$", re.MULTILINE)
+# Bold / underline-bold wrapping the start of a line: "**1. Services**" or
+# "**4. Law.** Delaware law governs." -> the markers go, the text stays.
+_LEADING_EMPHASIS = re.compile(r"^(?P<indent>[ \t]*)(?P<mark>\*\*|__)(?P<text>[^\n]+?)(?P=mark)", re.MULTILINE)
+
+
+def strip_markdown_heading_markup(markdown: str) -> str:
+    """Removes ATX heading markers ("## ") and a bold/underline wrapper at
+    the start of a line, leaving the heading text on its own line where
+    clause_parser can see it."""
+    text = _ATX_HEADING.sub(lambda m: m.group("text"), markdown)
+    return _LEADING_EMPHASIS.sub(lambda m: m.group("indent") + m.group("text"), text)
 
 
 class DocumentLoader(Protocol):
@@ -27,4 +55,4 @@ class DoclingLoader:
 
         converter = DocumentConverter()
         result = converter.convert(source_path)
-        return result.document.export_to_markdown()
+        return strip_markdown_heading_markup(result.document.export_to_markdown())
