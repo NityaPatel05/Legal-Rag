@@ -98,3 +98,27 @@ def test_top_k_limits_fused_results():
         top_k=2,
     )
     assert len(results) == 2
+
+
+def test_duplicate_within_one_list_is_counted_once_at_its_best_rank():
+    """L10: a clause listed twice by one retriever used to collect two RRF
+    terms and outrank a clause both retrievers agree on."""
+    dup_first = RetrievedClause(clause=make_clause("doc::dup"), metadata=make_metadata(), score=0.9, source="vector")
+    dup_again = RetrievedClause(clause=make_clause("doc::dup"), metadata=make_metadata(), score=0.5, source="vector")
+    agreed_v = RetrievedClause(clause=make_clause("doc::agreed"), metadata=make_metadata(), score=0.8, source="vector")
+    agreed_b = RetrievedClause(clause=make_clause("doc::agreed"), metadata=make_metadata(), score=4.0, source="bm25")
+
+    results = hybrid_retrieve(
+        "query",
+        vector_client=FakeVectorSearchClient([dup_first, dup_again, agreed_v]),
+        bm25_index=FakeBM25Index([agreed_b]),
+        permission_context=PermissionContext(tenant_id="tenant-1", matter_id="matter-1"),
+        query_filters=QueryFilters(),
+        top_k=10,
+    )
+
+    by_id = {r.clause.clause_id: r.score for r in results}
+    # dup: one term, rank 0. agreed: rank 1 in the deduped vector list + rank 0 in BM25.
+    assert by_id["doc::dup"] == 1.0 / 61
+    assert by_id["doc::agreed"] == 1.0 / 62 + 1.0 / 61
+    assert [r.clause.clause_id for r in results] == ["doc::agreed", "doc::dup"]

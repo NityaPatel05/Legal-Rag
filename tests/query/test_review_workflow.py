@@ -2,10 +2,14 @@
 evidence packet, and that a reviewer can only release grounded or
 explicitly-overridden claims."""
 
+import sqlite3
+import threading
+from datetime import datetime, timezone
+
 import pytest
 
 from query.filters.audit_log import InMemoryAuditLogger
-from query.review.schemas import ClaimAction, ClaimDecision, DecisionRequest, ReviewStatus
+from query.review.schemas import ClaimAction, ClaimDecision, DecisionRequest, ReviewAlreadyDecided, ReviewStatus
 from query.review.store import InMemoryReviewStore, SQLiteReviewStore
 from query.review.workflow import (
     ReviewConflictError,
@@ -193,3 +197,188 @@ def test_store_is_scoped_by_tenant_matter_and_status(store_kind, tmp_path):
     store.save(loaded)
     assert store.get(case.review_id).status == ReviewStatus.RESOLVED
     assert store.get("missing") is None
+
+
+# --- B16: decisions and first-view are conditional writes (no lost update) ---
+
+
+
+def _store(kind, tmp_path):
+    return InMemoryReviewStore() if kind == "memory" else SQLiteReviewStore(tmp_path / "r.sqlite3")
+
+
+def _reject_all(case):
+    return DecisionRequest(
+        reviewer="r",
+        decisions=[ClaimDecision(index=d.index, action=ClaimAction.REJECT) for d in case.draft_claims],
+    )
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_second_concurrent_decision_is_rejected_not_overwritten(store_kind, tmp_path):
+    """Both reviewers loaded the case while it was OPEN (so the in-Python
+    status check passes for both); only the first persisted decision wins."""
+    store = _store(store_kind, tmp_path)
+    case = _case()
+    store.add(case)
+    first, second = store.get(case.review_id), store.get(case.review_id)
+    audit = InMemoryAuditLogger()
+
+    apply_decision(first, _reject_all(first), all_clauses_by_id=ALL, store=store, audit_logger=audit)
+    second_request = _reject_all(second)
+    second_request.reviewer = "someone-else"
+    with pytest.raises(ReviewAlreadyDecided):
+        apply_decision(second, second_request, all_clauses_by_id=ALL, store=store, audit_logger=audit)
+
+    stored = store.get(case.review_id)
+    assert stored.status == ReviewStatus.RESOLVED
+    assert stored.outcome.reviewer == "r"
+    # The losing decision never took effect, so it isn't audited either.
+    assert [e.details["reviewer"] for e in audit.events if e.event_type == "review_decision"] == ["r"]
+
+
+def test_already_decided_is_a_conflict_error_for_the_409_mapping():
+    assert issubclass(ReviewAlreadyDecided, ReviewConflictError)
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_save_of_a_stale_resolved_case_raises_already_decided(store_kind, tmp_path):
+    """app/main.py's current path (apply_decision without store=, then
+    save) is also protected: save routes to the conditional write."""
+    store = _store(store_kind, tmp_path)
+    case = _case()
+    store.add(case)
+    a, b = store.get(case.review_id), store.get(case.review_id)
+    apply_decision(a, _reject_all(a), all_clauses_by_id=ALL)
+    store.save(a)
+    apply_decision(b, _reject_all(b), all_clauses_by_id=ALL)
+    with pytest.raises(ReviewAlreadyDecided):
+        store.save(b)
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_racing_decisions_from_threads_exactly_one_wins(store_kind, tmp_path):
+    store = _store(store_kind, tmp_path)
+    case = _case()
+    store.add(case)
+    loaded = [store.get(case.review_id) for _ in range(8)]
+    wins, losses = [], []
+    barrier = threading.Barrier(len(loaded))
+
+    def decide(c):
+        barrier.wait()
+        try:
+            apply_decision(c, _reject_all(c), all_clauses_by_id=ALL, store=store)
+            wins.append(c)
+        except ReviewAlreadyDecided:
+            losses.append(c)
+
+    threads = [threading.Thread(target=decide, args=(c,)) for c in loaded]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(wins) == 1 and len(losses) == len(loaded) - 1
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_marking_viewed_never_reopens_a_decided_case(store_kind, tmp_path):
+    """A GET that loaded the case while OPEN and saves its first view after
+    a decision committed must not write the OPEN body back."""
+    store = _store(store_kind, tmp_path)
+    case = _case()
+    store.add(case)
+    viewer_copy = store.get(case.review_id)
+    decider_copy = store.get(case.review_id)
+    apply_decision(decider_copy, _reject_all(decider_copy), all_clauses_by_id=ALL, store=store)
+
+    assert mark_viewed(viewer_copy) is True  # in-memory copy still thinks OPEN
+    store.save(viewer_copy)
+
+    stored = store.get(case.review_id)
+    assert stored.status == ReviewStatus.RESOLVED
+    assert stored.outcome is not None
+    assert stored.first_viewed_at is None
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_first_view_is_recorded_once(store_kind, tmp_path):
+    store = _store(store_kind, tmp_path)
+    case = _case()
+    store.add(case)
+    t1 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    t2 = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    assert store.mark_viewed(case.review_id, t1) is True
+    assert store.mark_viewed(case.review_id, t2) is False
+    assert store.get(case.review_id).first_viewed_at == t1
+    assert store.mark_viewed("missing", t1) is False
+
+    # Via the workflow helper: a second viewer's copy loses the conditional write.
+    other = _case()
+    store.add(other)
+    a, b = store.get(other.review_id), store.get(other.review_id)
+    assert mark_viewed(a, store=store) is True
+    assert mark_viewed(b, store=store) is False
+    assert store.get(other.review_id).first_viewed_at == a.first_viewed_at
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_record_decision_on_missing_case_is_lookup_error(store_kind, tmp_path):
+    store = _store(store_kind, tmp_path)
+    case = _case()
+    case.status = ReviewStatus.RESOLVED
+    with pytest.raises(LookupError):
+        store.record_decision(case)
+
+
+# --- L2: list every status ---
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_list_all_statuses(store_kind, tmp_path):
+    store = _store(store_kind, tmp_path)
+    open_case, decided = _case(), _case()
+    store.add(open_case)
+    store.add(decided)
+    loaded = store.get(decided.review_id)
+    apply_decision(loaded, _reject_all(loaded), all_clauses_by_id=ALL, store=store)
+
+    def ids(status):
+        return {c.review_id for c in store.list(tenant_id="tenant-1", matter_id="matter-1", status=status)}
+
+    assert ids("all") == ids(None) == {open_case.review_id, decided.review_id}
+    assert ids(ReviewStatus.OPEN) == {open_case.review_id}
+    assert ids(ReviewStatus.RESOLVED) == {decided.review_id}
+
+
+# --- L3: SQLite connections are closed ---
+
+
+def test_sqlite_store_closes_every_connection(tmp_path, monkeypatch):
+    opened: list = []
+    real_connect = sqlite3.connect
+
+    class TrackingConnection(sqlite3.Connection):
+        def close(self):
+            self.was_closed = True
+            super().close()
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, factory=TrackingConnection, **kwargs)
+        conn.was_closed = False
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+    store = SQLiteReviewStore(tmp_path / "r.sqlite3")
+    case = _case()
+    store.add(case)
+    store.get(case.review_id)
+    store.list(tenant_id="tenant-1", matter_id="matter-1")
+    store.mark_viewed(case.review_id, datetime.now(timezone.utc))
+    loaded = store.get(case.review_id)
+    apply_decision(loaded, _reject_all(loaded), all_clauses_by_id=ALL, store=store)
+    with pytest.raises(ReviewAlreadyDecided):
+        store.record_decision(loaded)
+
+    assert opened and all(c.was_closed for c in opened)

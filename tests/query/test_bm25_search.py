@@ -28,6 +28,36 @@ def test_returns_the_more_relevant_clause_first():
     assert results[0].source == "bm25"
 
 
+def _law_and_fees_corpus():
+    return [
+        (make_clause("doc::law", text="The laws of the State of Delaware govern."), make_metadata()),
+        (make_clause("doc::pay", text="The fees of the Supplier are due monthly."), make_metadata()),
+        *_distractor_clauses(6),
+    ]
+
+
+def test_stopword_only_overlap_is_not_a_match():
+    """L8: 'the' and 'of' appear in nearly every clause; before the fix any
+    question containing them matched the whole contract."""
+    index = InMemoryBM25Index(_law_and_fees_corpus())
+
+    # The only tokens shared with any clause are stopwords ("law" != "laws").
+    assert index.search("What is the governing law of the agreement?", top_k=10) == []
+
+
+def test_content_word_still_matches_alongside_stopwords():
+    index = InMemoryBM25Index(_law_and_fees_corpus())
+
+    results = index.search("Which state is it, Delaware?", top_k=10)
+
+    assert [r.clause.clause_id for r in results] == ["doc::law"]
+
+
+def test_stopword_only_query_returns_nothing():
+    corpus = [(make_clause("doc::a", text="The Supplier shall deliver."), make_metadata()), *_distractor_clauses(4)]
+    assert InMemoryBM25Index(corpus).search("what is the", top_k=5) == []
+
+
 def test_empty_corpus_returns_no_results():
     index = InMemoryBM25Index([])
     assert index.search("anything", top_k=5) == []

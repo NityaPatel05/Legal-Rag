@@ -21,6 +21,30 @@ from query.schemas import RetrievedClause
 
 _TOKEN = re.compile(r"[a-z0-9]+(?:[.'][a-z0-9]+)*")
 
+# Excluded from the "is this clause a match at all" overlap test only --
+# BM25 scoring still sees every token (their low IDF already down-weights
+# them there). Without this, any question containing "the" or "of"
+# overlapped every clause, so the filter admitted the whole contract and
+# top_k was filled with clauses that shared nothing but function words.
+# Deliberately just English function words + question words and the
+# ubiquitous contract modals ("shall", "will"): domain words that are merely
+# frequent ("party", "agreement") stay, since a question about them is
+# about something. "may" is kept out of the list (also a month).
+STOPWORDS = frozenset(
+    """
+    a about above after again against all also am an and any are as at be because been before
+    being below between both but by can could did do does doing done down during each either
+    else etc ever every few for from further had has have having he her here hers herself him
+    himself his how i if in into is it it's its itself just me might more most must my myself
+    neither no nor not now of off on once only or other ought our ours ourselves out over own
+    per please same she should so some such than that that's the their theirs them themselves
+    then there there's these they this those through thus to too under until up upon us very
+    was we were what what's when where whether which while who whom whose why will with within
+    without would you your yours yourself yourselves shall hereby herein hereof hereto
+    hereunder thereof therein thereto tell explain describe say says said
+    """.split()
+)
+
 
 def tokenize(text: str) -> list[str]:
     """Lowercase alphanumeric tokens, keeping "2.1" and "party's" intact.
@@ -40,7 +64,8 @@ class InMemoryBM25Index:
     scored every clause 0, and the `score > 0` filter then dropped the
     match. BM25Plus's IDF is always positive. It also adds a small positive
     score to documents with NO query terms, so "is this a match" is decided
-    by actual term overlap, not by score > 0."""
+    by actual term overlap, not by score > 0 -- overlap on non-stopword
+    terms (STOPWORDS)."""
 
     def __init__(self, corpus: list[tuple[Clause, ClauseMetadata]]):
         self._corpus = corpus
@@ -63,7 +88,11 @@ class InMemoryBM25Index:
             return []
         bm25 = self._bm25_instance()
         query_tokens = tokenize(query_text)
-        query_set = set(query_tokens)
+        # A query of nothing but stopwords matches nothing here (vector
+        # search still runs); it used to match everything.
+        query_set = set(query_tokens) - STOPWORDS
+        if not query_set:
+            return []
         scores = bm25.get_scores(query_tokens)
         ranked = sorted(
             (

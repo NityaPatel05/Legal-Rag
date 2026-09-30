@@ -38,6 +38,21 @@ def matches_all(retrieved: RetrievedClause, conditions: list[FilterCondition]) -
     return all(_field_value(retrieved, c.field) == c.value for c in conditions)
 
 
+def _dedupe_by_clause_id(ranked: list[RetrievedClause]) -> list[RetrievedClause]:
+    """Keeps each clause's first (best) rank. RRF sums one term per list a
+    clause appears in; a clause listed twice in ONE list (e.g. a store
+    returning the same point twice) would otherwise get two terms and
+    outrank a clause both retrievers agree on. Ranks are recomputed on the
+    deduped list, so the clauses below a duplicate move up one."""
+    seen: set[str] = set()
+    out: list[RetrievedClause] = []
+    for retrieved in ranked:
+        if retrieved.clause.clause_id not in seen:
+            seen.add(retrieved.clause.clause_id)
+            out.append(retrieved)
+    return out
+
+
 def build_filters(permission_context: PermissionContext, query_filters: QueryFilters) -> list[FilterCondition]:
     return (
         build_permission_filter(permission_context)
@@ -70,7 +85,7 @@ def hybrid_retrieve(
     rrf_scores: dict[str, float] = {}
     by_clause_id: dict[str, RetrievedClause] = {}
     for ranked_list in (vector_results, bm25_results):
-        for rank, retrieved in enumerate(ranked_list):
+        for rank, retrieved in enumerate(_dedupe_by_clause_id(ranked_list)):
             clause_id = retrieved.clause.clause_id
             rrf_scores[clause_id] = rrf_scores.get(clause_id, 0.0) + 1.0 / (_RRF_K + rank + 1)
             by_clause_id.setdefault(clause_id, retrieved)

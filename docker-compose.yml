@@ -1,35 +1,71 @@
 # Local/dev deployment. `docker compose up --build`, then see README.md's
 # deployment section for the ingest -> query smoke test.
+#
+# Required in .env (compose reads the project .env for ${...} interpolation
+# too): QDRANT_API_KEY and API_KEYS. `up` refuses to start without
+# QDRANT_API_KEY rather than run an unauthenticated vector store.
+#
+# Network exposure: only the app's API is published on all interfaces (it
+# authenticates every request, fail-closed -- invariant #14). Qdrant and the
+# embedding server are reached by the app over the compose network by
+# service name; their host ports are bound to 127.0.0.1 only, for host-side
+# dev tools (uvicorn --reload outside compose, eval --embed-url). Drop those
+# `ports:` entries entirely in any shared/production deployment. A plain
+# "6333:6333" publishes on 0.0.0.0, and on Linux Docker's iptables rules
+# bypass ufw, so "the firewall blocks it" is not a safe assumption.
 services:
   qdrant:
     # Keep the server's minor version in step with the installed
     # qdrant-client (1.18): the client warns on a >1 minor-version gap and
     # the app uses query_points/prefetch APIs added in newer servers.
     image: qdrant/qdrant:v1.18.3
+    restart: unless-stopped
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
+    environment:
+      # Static API key for every REST/gRPC request (Qdrant security guide).
+      # The app sends it via QDRANT_API_KEY (Settings.qdrant_api_key, passed to
+      # every QdrantClient). Inside the compose network the connection is plain
+      # HTTP, so qdrant-client logs an "insecure connection" warning; that is
+      # expected here -- the key never leaves the host. Use TLS if Qdrant is
+      # ever reached across a real network.
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?set QDRANT_API_KEY in .env}
     volumes:
       - qdrant_data:/qdrant/storage
-    # No healthcheck here -- qdrant/qdrant is a third-party image and its
-    # available shell tools (curl/wget/bash) weren't verified in this
-    # environment. The app retries its own Qdrant connection on startup
-    # instead (see app/main.py's _ensure_qdrant_collection), so correctness
-    # doesn't depend on this healthcheck being right.
+    healthcheck:
+      # The qdrant image deliberately ships no curl/wget/nc (qdrant/qdrant
+      # issue #4250), but it has bash, so a TCP connect via bash's /dev/tcp is
+      # the check Qdrant's own compose file uses. It proves the HTTP listener
+      # is up; the app's startup retry (_ensure_qdrant_collection) still covers
+      # anything later than that. Must be `bash -c`: /dev/tcp is a bash
+      # feature, not a real device, so CMD-SHELL's /bin/sh can't do it.
+      test: ["CMD", "bash", "-c", ":> /dev/tcp/127.0.0.1/6333"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   embedding-server:
     build:
       context: .
       dockerfile: embedding_server/Dockerfile
+    restart: unless-stopped
     ports:
-      # Host-side 8081 -- 8080 is already taken by another project's
-      # kafka-ui container on this machine. Container-internal port (and
-      # every in-cluster reference to it, e.g. BGE_M3_ENDPOINT below) stays
-      # 8080, since that's Docker-network-internal and unaffected by the
-      # host remap.
-      - "8081:8080"
+      # Loopback only: the server has no authentication. Host-side 8081 --
+      # 8080 is already taken by another project's kafka-ui container on
+      # this machine. The container-internal port (and BGE_M3_ENDPOINT below)
+      # stays 8080.
+      - "127.0.0.1:8081:8080"
+    environment:
+      # Pin to a commit sha for reproducible embeddings (see
+      # embedding_server/main.py); override in .env to move it deliberately.
+      EMBEDDING_MODEL_REVISION: ${EMBEDDING_MODEL_REVISION:-5617a9f61b028005a4858fdac845db406aefb181}
     volumes:
-      # BGE-M3 weights (~2GB) survive container rebuilds.
-      - hf_cache:/root/.cache/huggingface
+      # BGE-M3 weights (~2GB) survive container rebuilds. The image runs as
+      # the non-root `app` user, whose HF cache lives under /home/app (a
+      # volume created by the old root image needs a chown or `docker volume
+      # rm` -- see embedding_server/Dockerfile).
+      - hf_cache:/home/app/.cache/huggingface
     healthcheck:
       # /health is 503 until the model has loaded (see embedding_server/main.py).
       # python, not curl/wget -- python:3.11-slim doesn't ship either, but
@@ -44,6 +80,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    restart: unless-stopped
     ports:
       - "8000:8000"
     env_file:
@@ -52,20 +89,32 @@ services:
       # Override whatever's in .env for the two in-cluster services --
       # .env's defaults (localhost) are for running the app outside compose.
       QDRANT_URL: http://qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:?set QDRANT_API_KEY in .env}
       BGE_M3_ENDPOINT: http://embedding-server:8080
       AUDIT_LOG_PATH: /app/audit/audit.jsonl
       REVIEW_DB_PATH: /app/reviews/reviews.sqlite3
+      # LangChain/LangGraph auto-tracing OFF, whatever .env says. With either
+      # flag on, LangGraph traces the whole CRAG state -- contract text, the
+      # question, draft answers -- to LangSmith. The explicit
+      # LangSmithTraceExporter (enabled by LANGSMITH_API_KEY) exports only
+      # hashes and counts and does not depend on these flags. Opting into full
+      # auto-tracing is a data-handling decision: change these lines on
+      # purpose, don't inherit it from a copied .env.
+      LANGCHAIN_TRACING_V2: "false"
+      LANGSMITH_TRACING: "false"
       # .env must set API_KEYS: the app refuses to start without it, and
       # DEV_MODE (loopback-only) can't work here -- host requests reach the
       # container over the Docker bridge, not loopback.
     depends_on:
       qdrant:
-        condition: service_started
+        condition: service_healthy
       embedding-server:
         # Not just started: the model must be loaded, or the first ingest's
-        # /embed call outlives BGEM3Embedder's 30s timeout.
+        # /embed calls queue behind a multi-minute model download.
         condition: service_healthy
     volumes:
+      # Owned by the image's non-root `app` user; volumes created by the old
+      # root image need a one-time chown (command in Dockerfile).
       - audit_logs:/app/audit
       - review_queue:/app/reviews  # human review queue (SQLite) survives restarts
     healthcheck:

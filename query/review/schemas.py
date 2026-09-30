@@ -4,7 +4,11 @@ A ReviewCase is the evidence packet a reviewing lawyer decides on, and it is
 also the persisted state of the review: everything a decision needs (the
 question, the clauses the model saw, each draft claim with its quote and the
 validator's verdict) is copied in at queue time, so deciding never depends on
-re-running the model."""
+re-running the model.
+
+The review exceptions live here too, not in workflow.py, because both the
+workflow and the store raise them and the store must not import the
+workflow (which pulls in the CRAG graph). workflow.py re-exports them."""
 
 from __future__ import annotations
 
@@ -15,9 +19,36 @@ from pydantic import BaseModel, Field
 
 from query.schemas import RetrievalTraceStep
 
+# Identifier fields in request bodies (document/tenant/matter ids). No ":" --
+# clause ids are "<document_id>::clause-NNNN".
+ID_PATTERN = r"^[A-Za-z0-9._-]{1,128}$"
+
+# Reviewer-supplied free text. Generous for legal prose, but bounded: an edited
+# claim is re-validated against every clause of the document.
+MAX_CLAIM_CHARS = 4_000
+MAX_QUOTE_CHARS = 20_000
+MAX_CITATION_CHARS = 300  # a clause_id (<=128-char document id + suffix) or section id
+MAX_REASON_CHARS = 4_000
+MAX_REVIEWER_CHARS = 200
+MAX_DECISIONS = 500
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class ReviewDecisionError(ValueError):
+    """The decision request is malformed or incomplete (HTTP 422)."""
+
+
+class ReviewConflictError(Exception):
+    """The case is already resolved (HTTP 409)."""
+
+
+class ReviewAlreadyDecided(ReviewConflictError):
+    """A decision lost the race: the store's conditional write found the case
+    no longer open (another decision committed first). HTTP 409, like its
+    parent -- raised by ReviewStore.record_decision / save."""
 
 
 class ReviewStatus(str, Enum):
@@ -60,20 +91,20 @@ class ClaimDecision(BaseModel):
 
     index: int | None = None
     action: ClaimAction
-    claim_text: str | None = None
-    citation: str | None = None
-    supporting_quote: str | None = None
+    claim_text: str | None = Field(default=None, max_length=MAX_CLAIM_CHARS)
+    citation: str | None = Field(default=None, max_length=MAX_CITATION_CHARS)
+    supporting_quote: str | None = Field(default=None, max_length=MAX_QUOTE_CHARS)
     # Required whenever the claim, as decided, fails the citation validator.
-    override_reason: str | None = None
+    override_reason: str | None = Field(default=None, max_length=MAX_REASON_CHARS)
 
 
 class DecisionRequest(BaseModel):
     """Every draft claim needs its own decision -- there is deliberately no
     "approve all" (H2: bulk approval is where automation bias lives)."""
 
-    reviewer: str = Field(min_length=1)
-    decisions: list[ClaimDecision]
-    note: str | None = None
+    reviewer: str = Field(min_length=1, max_length=MAX_REVIEWER_CHARS)
+    decisions: list[ClaimDecision] = Field(max_length=MAX_DECISIONS)
+    note: str | None = Field(default=None, max_length=MAX_REASON_CHARS)
 
 
 class ReviewedClaim(BaseModel):

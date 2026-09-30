@@ -1,7 +1,13 @@
 # Deliberately separate from the main app's requirements.txt -- this
 # service needs FlagEmbedding + torch (large, ML-heavy), the main app
 # doesn't and shouldn't pull them in.
-fastapi
-uvicorn[standard]
-FlagEmbedding
-torch
+#
+# fastapi/uvicorn/torch pinned to the versions installed and tested locally
+# (same as the main requirements.txt). FlagEmbedding isn't installed on the
+# dev machine, so it gets a bounded range; pin it (==) from `pip freeze`
+# inside the first verified image build. The Dockerfile installs the CPU
+# torch wheel first; `torch==2.8.0` accepts that `2.8.0+cpu` build.
+fastapi==0.135.1
+uvicorn[standard]==0.41.0
+FlagEmbedding>=1.3,<2
+torch==2.8.0

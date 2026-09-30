@@ -15,18 +15,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # docling (and sentence-transformers, for the optional NLI check) pull in
 # torch. Install the CPU wheel first: pip's default Linux torch is the CUDA
 # build, which drags in several GB of nvidia-* wheels this CPU image never
-# uses. The cache mount keeps a requirements.txt edit from re-downloading
-# everything.
+# uses. Pinned (same version as embedding_server/requirements.txt and the
+# locally tested install) so a rebuild can't silently move it. The cache
+# mount keeps a requirements.txt edit from re-downloading everything.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install torch --index-url https://download.pytorch.org/whl/cpu
+    pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements.txt
 
+# Non-root runtime user. The app parses counterparty-authored documents
+# (docling) and talks to third-party APIs; if any of that is ever exploited,
+# it should not be root in the container. Fixed UID so volume ownership is
+# predictable. /app/audit and /app/reviews are created here, owned by the
+# user, so the named volumes compose mounts there start out writable (Docker
+# copies the image directory's ownership into an empty named volume).
+# Upgrading a volume created by the old root image: run once
+#   docker compose run --rm --user root app chown -R app:app /app/audit /app/reviews
+RUN groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid app --create-home --home-dir /home/app app \
+    && mkdir -p /app/audit /app/reviews \
+    && chown -R app:app /app/audit /app/reviews
+
 COPY ingestion/ ./ingestion/
 COPY query/ ./query/
 COPY app/ ./app/
+
+USER app
 
 EXPOSE 8000
 

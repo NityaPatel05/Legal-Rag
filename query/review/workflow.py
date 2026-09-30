@@ -21,7 +21,16 @@ answerable from the audit log.
 
 Against automation bias (H2, arXiv:2507.19486): every draft claim needs its
 own decision (no approve-all), validator failures are listed first, and the
-time from first opening the case to deciding is recorded."""
+time from first opening the case to deciding is recorded.
+
+Exactly one decision per case, even under concurrency: pass `store=` to
+`apply_decision` and the resolved case is persisted with the store's
+conditional write (only if still open) BEFORE anything is audited, so a
+losing concurrent decision raises ReviewAlreadyDecided (a
+ReviewConflictError, HTTP 409) and leaves no audit trail of a decision that
+never took effect. `mark_viewed(case, store=...)` likewise records the first
+view with a conditional update instead of a whole-case save that could
+overwrite a decision."""
 
 from __future__ import annotations
 
@@ -30,18 +39,22 @@ import uuid
 from ingestion.schemas import Clause, ClauseMetadata
 from query.filters.audit_log import AuditEvent, AuditLogger
 from query.generation.crag_graph import compose_answer_text
-from query.review.schemas import (
+from query.review.schemas import (  # noqa: F401 -- exceptions re-exported for app/main.py
     ClaimAction,
     ClaimDecision,
     DecisionRequest,
     DraftClaim,
+    ReviewAlreadyDecided,
     ReviewCase,
+    ReviewConflictError,
+    ReviewDecisionError,
     ReviewedClaim,
     ReviewOutcome,
     ReviewStatus,
     ShownClause,
     _now,
 )
+from query.review.store import ReviewStore
 from query.schemas import PermissionContext, RetrievalTraceStep, RetrievedClause
 from query.validation.citation_validator import Citation, EntailmentChecker, validate_citation
 from query.validation.strip_unsupported import Claim
@@ -49,15 +62,11 @@ from query.validation.strip_unsupported import Claim
 # Outcomes a human should look at. "answered_with_stripped_claims" is
 # included: the stripped claims may be correct ones the validator rejected
 # (L19), and the user has only received the part that survived.
-REVIEWABLE_STATUSES = frozenset({"flagged_for_review", "answered_with_stripped_claims"})
-
-
-class ReviewDecisionError(ValueError):
-    """The decision request is malformed or incomplete (HTTP 422)."""
-
-
-class ReviewConflictError(Exception):
-    """The case is already resolved (HTTP 409)."""
+# "not_found" (crag_graph: every retrieval attempt graded insufficient) is
+# included too: "the contract doesn't address this" is itself a legal
+# conclusion, and a retrieval miss looks identical to it -- a human confirms
+# the absence.
+REVIEWABLE_STATUSES = frozenset({"flagged_for_review", "answered_with_stripped_claims", "not_found"})
 
 
 def should_queue(final_state: dict) -> bool:
@@ -120,13 +129,22 @@ def _shown_clause(rc: RetrievedClause) -> ShownClause:
     )
 
 
-def mark_viewed(case: ReviewCase) -> bool:
+def mark_viewed(case: ReviewCase, *, store: ReviewStore | None = None) -> bool:
     """Records the first time a reviewer opens the case. Returns True if
-    the case changed and should be saved."""
-    if case.first_viewed_at is None and case.status == ReviewStatus.OPEN:
-        case.first_viewed_at = _now()
-        return True
-    return False
+    the case changed.
+
+    With `store`, the first view is persisted by the store's conditional
+    update (first_viewed_at IS NULL AND status open) and the return value
+    says whether this call won; nothing else needs saving. Without it, the
+    caller saves -- ReviewStore.save routes an open case to the same
+    conditional update."""
+    if case.first_viewed_at is not None or case.status != ReviewStatus.OPEN:
+        return False
+    viewed_at = _now()
+    if store is not None and not store.mark_viewed(case.review_id, viewed_at):
+        return False
+    case.first_viewed_at = viewed_at
+    return True
 
 
 def apply_decision(
@@ -136,9 +154,16 @@ def apply_decision(
     all_clauses_by_id: dict[str, tuple[Clause, ClauseMetadata]],
     audit_logger: AuditLogger | None = None,
     entailment_checker: EntailmentChecker | None = None,
+    store: ReviewStore | None = None,
 ) -> ReviewCase:
     """Validates the request, re-validates every accepted claim against the
     current document, and resolves the case. Mutates and returns `case`.
+
+    With `store`, the resolved case is persisted atomically-if-still-open
+    before auditing; a concurrent decision that got there first raises
+    ReviewAlreadyDecided (HTTP 409) and nothing is audited. Without it the
+    caller must persist (ReviewStore.save / record_decision) -- and the
+    audit events are already written by then.
 
     The reviewer has the whole contract, not just the clauses the model was
     shown, so a reviewer's citation may point at any clause of the document
@@ -220,6 +245,8 @@ def apply_decision(
         note=request.note,
     )
     case.status = ReviewStatus.RESOLVED
+    if store is not None:
+        store.record_decision(case)  # raises ReviewAlreadyDecided if a concurrent decision won
     _audit(case, audit_logger)
     return case
 

@@ -14,6 +14,9 @@ requires-python = ">=3.11"
 # rather than loading the model in-process, so those heavy ML deps live only
 # in embedding_server/requirements.txt, the one service that actually needs
 # them. Keeps the main app image small and its startup fast.
+#
+# Ranges here (it's the package metadata); requirements.txt is the pinned
+# deploy set the Docker image installs.
 dependencies = [
     "fastapi",
     "uvicorn[standard]",
@@ -25,9 +28,8 @@ dependencies = [
     "groq",               # LLM provider: metadata tagging, context enrichment, jailbreak classifier
     "httpx",              # OpenAICompatibleLLMClient: self-hosted LLM for privileged documents
     "rank_bm25",           # keyword-search half of hybrid retrieval
-    "ragas",
-    "datasets",           # CUAD loading
-    "langsmith",
+    # ragas / datasets removed: nothing imports them (eval/ reads CUAD_v1.json).
+    "langsmith>=0.6.3,<1.0",  # CVE-2026-25528 fixed in 0.6.3; langchain-core needs <1.0
     "pydantic",
     "pydantic-settings",
     "python-dotenv",
