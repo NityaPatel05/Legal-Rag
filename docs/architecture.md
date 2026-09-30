@@ -17,8 +17,11 @@ built, where it lives, and where reality diverged from the plan. See
 [`README.md`](../README.md) for the user-facing overview, diagrams, and API
 reference; this section is the terse implementation index.
 
-**All six build-order steps (§11) are implemented — 163 tests, all
-fake/fixture-based.** File mapping:
+**All six build-order steps (§11) are implemented.** A 2026-09 design
+review changed several of the decisions below (citation key, span check,
+document-level metadata, passage splitting, retry semantics) — see
+`CLAUDE.md` "Review findings" for what changed and why; where this spec and
+CLAUDE.md disagree, CLAUDE.md is current. File mapping:
 
 | Spec section | Lives in |
 |---|---|

@@ -55,7 +55,7 @@ def test_permission_and_jurisdiction_filters_are_passed_to_vector_search():
     )
 
     fields = {c.field: c.value for c in vector_client.last_filters}
-    assert fields == {"tenant_id": "tenant-1", "matter_id": "matter-1", "jurisdiction": "New York"}
+    assert fields == {"tenant_id": "tenant-1", "matter_id": "matter-1", "jurisdiction": "new york"}
 
 
 def test_mismatched_tenant_bm25_result_is_dropped_before_fusion():

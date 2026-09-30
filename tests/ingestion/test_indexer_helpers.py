@@ -16,25 +16,25 @@ def test_document_id_from_clause_id_matches_clause_parser_convention():
 
 
 def test_point_id_for_clause_is_a_valid_uuid():
-    point_id = point_id_for_clause("doc-1::clause-000")
+    point_id = point_id_for_clause("doc-1::clause-000", tenant_id="t1", matter_id="m1")
     assert uuid.UUID(point_id)  # raises ValueError if not a valid UUID string
 
 
 def test_point_id_for_clause_is_deterministic():
     """Re-ingesting the same document must produce the same point ids, so
     upsert is idempotent rather than creating duplicate points."""
-    assert point_id_for_clause("doc-1::clause-000") == point_id_for_clause("doc-1::clause-000")
+    assert point_id_for_clause("doc-1::clause-000", tenant_id="t1", matter_id="m1") == point_id_for_clause("doc-1::clause-000", tenant_id="t1", matter_id="m1")
 
 
 def test_point_id_for_clause_differs_across_clauses():
-    assert point_id_for_clause("doc-1::clause-000") != point_id_for_clause("doc-1::clause-001")
+    assert point_id_for_clause("doc-1::clause-000", tenant_id="t1", matter_id="m1") != point_id_for_clause("doc-1::clause-001", tenant_id="t1", matter_id="m1")
 
 
 def test_point_id_for_reference_is_a_valid_deterministic_uuid():
-    point_id = point_id_for_reference("doc-1", 0)
+    point_id = point_id_for_reference("doc-1", 0, tenant_id="t1", matter_id="m1")
     assert uuid.UUID(point_id)
-    assert point_id_for_reference("doc-1", 0) == point_id_for_reference("doc-1", 0)
-    assert point_id_for_reference("doc-1", 0) != point_id_for_reference("doc-1", 1)
+    assert point_id_for_reference("doc-1", 0, tenant_id="t1", matter_id="m1") == point_id_for_reference("doc-1", 0, tenant_id="t1", matter_id="m1")
+    assert point_id_for_reference("doc-1", 0, tenant_id="t1", matter_id="m1") != point_id_for_reference("doc-1", 1, tenant_id="t1", matter_id="m1")
 
 
 def _indexer_with_fake_client(fake_client) -> QdrantIndexer:

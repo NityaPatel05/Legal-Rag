@@ -2,8 +2,8 @@
 step 3 / architecture.md B1-B7: input sanitization -> jailbreak classifier ->
 permission filter -> jurisdiction/governing-law filter -> router -> hybrid
 retrieval -> rerank -> cross-reference expansion -> reorder. Stops here,
-before generation — CLAUDE.md's build order adds the citation validator and
-CRAG evaluator (steps 4-5) before wiring in actual answer generation.
+before generation; query/generation/crag_graph.py's run_crag takes the
+QueryResult from there. An out-of-scope route skips retrieval entirely.
 
 If the jailbreak classifier flags the query, the pipeline short-circuits
 before the permission filter or vector store are touched at all —
@@ -25,7 +25,7 @@ log / don't export) so adding either never breaks an existing caller."""
 from __future__ import annotations
 
 from ingestion.metadata.llm_client import LLMClient
-from ingestion.schemas import Clause, ClauseMetadata, SectionReference
+from ingestion.schemas import Clause, ClauseMetadata, DefinedTerm, SectionReference
 from query.filters.audit_log import AuditEvent, AuditLogger
 from query.filters.jailbreak_classifier import classify_query
 from query.filters.permission import PermissionViolation, assert_permission
@@ -34,6 +34,7 @@ from query.generation.router import classify_route
 from query.observability.langsmith_tracer import NullTraceExporter, TraceExporter
 from query.retrieval.bm25_search import BM25Index
 from query.retrieval.hybrid import hybrid_retrieve
+from query.retrieval.passage_context import expand_with_sibling_passages
 from query.retrieval.reference_expansion import expand_with_references
 from query.retrieval.reorder import reorder_for_generation
 from query.retrieval.reranker import Reranker
@@ -60,6 +61,8 @@ def process_query(
     rerank_top_k: int = 5,
     audit_logger: AuditLogger | None = None,
     trace_exporter: TraceExporter | None = None,
+    defined_terms: list[DefinedTerm] | None = None,
+    all_clauses_by_id: dict[str, tuple[Clause, ClauseMetadata]] | None = None,
 ) -> QueryResult:
     trace_exporter = trace_exporter or NullTraceExporter()
 
@@ -97,6 +100,11 @@ def process_query(
 
     route = classify_route(query_text, llm_client=llm_client)
     trace: list[RetrievalTraceStep] = []
+    if route == RouteType.AMBIGUOUS_OUT_OF_SCOPE:
+        # Nothing to retrieve for; run_crag flags this route for review.
+        result = QueryResult(query_text=query_text, route=route, jailbreak_check=jailbreak_check)
+        trace_exporter.export(result)
+        return result
 
     candidates = hybrid_retrieve(
         query_text,
@@ -116,6 +124,8 @@ def process_query(
         reranked,
         all_clauses_by_section_id=all_clauses_by_section_id,
         references=references,
+        defined_terms=defined_terms,
+        all_clauses_by_id=all_clauses_by_id,
     )
     trace.append(RetrievalTraceStep(stage="reference_expansion", clause_ids=_clause_ids(expanded)))
     _assert_permission_and_audit(expanded, permission_context, audit_logger)
@@ -123,11 +133,30 @@ def process_query(
     reordered = reorder_for_generation(expanded)
     trace.append(RetrievalTraceStep(stage="reorder", clause_ids=_clause_ids(reordered)))
 
+    with_context = expand_with_sibling_passages(reordered, all_clauses_by_id=all_clauses_by_id)
+    trace.append(RetrievalTraceStep(stage="passage_context", clause_ids=_clause_ids(with_context)))
+    _assert_permission_and_audit(with_context, permission_context, audit_logger)
+
+    # Clauses flagged at ingestion as instruction-like (injection_scan.py) are
+    # still shown -- they're evidence -- but the reviewer sees which ones.
+    flagged = [rc.clause.clause_id for rc in with_context if rc.metadata.injection_suspected]
+    if flagged:
+        trace.append(RetrievalTraceStep(stage="injection_flagged", clause_ids=flagged))
+        if audit_logger:
+            audit_logger.log(
+                AuditEvent(
+                    event_type="injection_suspected_clause_retrieved",
+                    tenant_id=permission_context.tenant_id,
+                    matter_id=permission_context.matter_id,
+                    details={"clause_ids": flagged},
+                )
+            )
+
     result = QueryResult(
         query_text=query_text,
         route=route,
         jailbreak_check=jailbreak_check,
-        retrieved_clauses=reordered,
+        retrieved_clauses=with_context,
         trace=trace,
     )
     trace_exporter.export(result)

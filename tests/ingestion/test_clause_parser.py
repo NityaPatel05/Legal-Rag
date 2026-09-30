@@ -144,3 +144,50 @@ def test_lettered_subsections_reused_later_in_the_document_do_not_collide():
     assert all(c.section_id is None for c in lettered_clauses)
     # all four remain distinct, non-overlapping clauses despite the letter reuse
     assert len({c.clause_id for c in lettered_clauses}) == 4
+
+
+def test_indented_numbered_heading_creates_a_boundary():
+    """R13: 64 of CUAD's 183 under-segmented documents indent their headings."""
+    text = "Preamble.\n\n    1. Services\n\nVendor provides services.\n\n    2. Fees\n\nCustomer pays."
+    clauses = parse_clauses(text, document_id="doc-10")
+
+    assert [(c.section_id, c.heading) for c in clauses] == [
+        (None, None),
+        ("1", "Services"),
+        ("2", "Fees"),
+    ]
+
+
+def test_flattened_text_headings_are_found_mid_line():
+    """R13: text extracted with its newlines lost puts every heading mid-line."""
+    text = (
+        'This Agreement is made by Acme ("Licensor"). SECTION 1. GRANT Section 1.1 '
+        "License. Licensor grants a license. Section 1.2 Sublicensing. Licensee may "
+        "sublicense. 2. Term. The term is one year. 3. Termination. Either party may terminate."
+    )
+    clauses = parse_clauses(text, document_id="doc-11")
+
+    assert [c.section_id for c in clauses] == [None, "1", "1.1", "1.2", "2", "3"]
+    assert clauses[4].heading == "Term"
+    assert clauses[1].text.startswith("SECTION 1.")
+    # contiguous: no characters lost or duplicated at inline boundaries
+    assert "".join(c.text for c in clauses) == text
+
+
+def test_inline_cross_references_and_stray_numbers_are_not_headings():
+    """Numbers that break the section sequence are rejected, so a mid-sentence
+    'Section 12.3' reference or an amount does not start a clause."""
+    text = (
+        "Preamble. 1. Grant. Licensor grants a license, subject to Section 12.3 Licensee "
+        "obligations. The fee is $5. 7 Parties may review it. 2. Term. One year."
+    )
+    clauses = parse_clauses(text, document_id="doc-12")
+
+    assert [c.section_id for c in clauses] == [None, "1", "2"]
+
+
+def test_inline_pass_is_skipped_when_line_headings_are_found():
+    text = "1. Grant\n\nSee the terms. 7. Other text.\n\n2. Term\n\nOne year.\n\n3. Fees\n\nPaid."
+    clauses = parse_clauses(text, document_id="doc-13")
+
+    assert [c.section_id for c in clauses] == ["1", "2", "3"]

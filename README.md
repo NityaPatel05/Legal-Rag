@@ -10,10 +10,15 @@ every generated claim is wrong until a code-level check proves it's grounded in
 the actual clause text.** The citation validator isn't a nice-to-have layered on
 top of generation — it's a first-class pipeline stage with its own test suite.
 
-**Status:** all 6 build-order steps implemented, plus guardrails, a deployable
-FastAPI service, and a Docker Compose stack. **163 tests passing.** The one
-thing that isn't code: Stage 2 eval needs an actual lawyer (see
-[`eval/golden_set/README.md`](eval/golden_set/README.md)).
+**Status:** pipeline implemented end to end (ingestion, hybrid retrieval, CRAG,
+citation validation, FastAPI, Docker Compose). Run `pytest tests/` for the
+current count; the suite includes a round-trip against a real (in-memory)
+Qdrant client and HTTP tests of the real app (`tests/app/`). A design review in
+2026-09 found and fixed several production-breaking and logic bugs; the
+findings, what changed, and the prioritized roadmap (with per-item status)
+live in [`CLAUDE.md`](CLAUDE.md). Retrieval is measured on CUAD
+(`eval/retrieval/`); the golden-set gate exists but Stage 2 eval still needs
+an actual lawyer (see [Known gaps](#known-gaps)).
 
 Full design rationale: [`docs/architecture.md`](docs/architecture.md) (v3 spec).
 Context for AI coding sessions: [`CLAUDE.md`](CLAUDE.md).
@@ -175,7 +180,7 @@ owned by this repo.
 
 Every external integration sits behind a Protocol (`LLMClient`,
 `EmbeddingClient`, `VectorStore`, `Reranker`, ...) with the real adapter
-lazy-importing its SDK. That's what makes 163 tests runnable with zero live
+lazy-importing its SDK. That's what makes the test suite runnable with zero live
 services — every test injects a fake implementing the same interface.
 
 ## Project layout
@@ -192,12 +197,15 @@ query/                        Online, per user question
   validation/                      Citation validator, strip-unsupported-claims fallback
   observability/                    LangSmith trace export
 eval/
-  cuad_preflight/               Stage 1: real 510-contract CUAD pass — see reports/boundary_report.json
-  golden_set/                    Stage 2: lawyer-review harness, metrics, draft starter questions
+  cuad_preflight/               Stage 1: chunk_quality.py (containment + span precision + size vs. model limits)
+  retrieval/                     cuad_recall.py — hit@k / span recall@k / char-budget recall on CUAD (R1, R3)
+  golden_set/                    Stage 2: golden.py gate + unreviewed example set (lawyer review required)
 app/                          FastAPI service — /health, /documents/text, /query
 embedding_server/            Standalone BGE-M3 service, own Dockerfile
 tests/
-  ingestion/ query/ eval/ app/  163 tests, all run against fakes — no live services needed
+  ingestion/ query/ integration/  unit tests on fakes + real in-memory Qdrant round-trip
+  app/                            HTTP tests: real app + in-memory Qdrant via dependency_overrides
+  eval/                           eval metric / gate tests
 docs/
   architecture.md               Full v3 design spec + as-built notes
 Dockerfile · docker-compose.yml · embedding_server/Dockerfile
@@ -227,13 +235,26 @@ Self-Querying Retriever, the recent case-law / external legal authority module.
 
 ## Known gaps
 
+- **Missing from the repo despite being described below:** the original CUAD
+  pre-flight runner (`run_preflight`, `classification_check.py`).
+  `boundary_report.json` exists locally but the code that produced it does
+  not; `eval/cuad_preflight/chunk_quality.py` re-implements the boundary
+  measurement and adds the metrics it was missing.
+- **No lawyer-reviewed golden set.** `eval/golden_set/golden.py` enforces the
+  gate (citation accuracy blocking, `is_certifiable()` needs >= 40 reviewed
+  items); `golden_set.example.jsonl` is an unreviewed template.
+- **Retrieval is measured for BM25 only.** On CUAD (510 contracts, 6,702
+  questions, per-document), BM25 hit@5 = 0.69 vs a 0.21 random baseline
+  (`eval/retrieval/`). Dense/hybrid numbers need the BGE-M3 server running,
+  and LegalBench-RAG hasn't been run — see CLAUDE.md R1/R3.
+
 - **RAGAS faithfulness scoring** and the **CUAD classification-accuracy pass**
   aren't wired to run live — both need a real corpus / API budget to mean
   anything, not synthetic fixtures.
-- **~36% of CUAD documents still under-segment** (≤2 clauses). Down from 42%
-  after adding ALL-CAPS and lettered-subsection heading patterns — see
-  `ingestion/parsing/clause_parser.py`'s docstring for the measured before/after
-  and the residual causes weren't re-diagnosed after that pass.
+- **~10% of CUAD documents still under-segment** (≤2 clauses, 53/510). Down
+  from 36% after R13 (indented headings + a guarded inline pass for flattened
+  text); 39 of the 53 use roman-numeral, "(a)"-style or no numbering — see
+  `ingestion/parsing/clause_parser.py`'s docstring for the measured before/after.
 - **Docling file upload isn't exposed over HTTP yet** — `POST /documents/text`
   takes already-extracted text; `DoclingLoader` is built and ready, just not
   wired to an upload endpoint.
@@ -246,7 +267,7 @@ Self-Querying Retriever, the recent case-law / external legal authority module.
 ```bash
 cp .env.example .env      # fill in GROQ_API_KEY at minimum
 pip install -r requirements.txt
-pytest tests/             # 163 tests, all fakes — no live services needed
+pytest tests/             # no live services needed
 ```
 
 ## Deployment (Docker Compose)
@@ -324,7 +345,7 @@ Runs the full retrieval → generation → citation-validation → CRAG pipeline
 Returns `404` if the tenant/matter combination has no matching document —
 including when a *different* tenant asks about a document that exists for
 someone else. That's the permission-first filter, verified through the actual
-HTTP surface in `tests/app/test_main.py`, not just unit-tested in isolation.
+HTTP surface (`tests/app/` is not in the repo yet — see [Known gaps](#known-gaps)).
 
 ### `GET /health`
 
@@ -336,9 +357,8 @@ Liveness check, `{"status": "ok"}`.
 pytest tests/                          # everything, ~6s, no live services
 pytest tests/ingestion/                # clause parsing, tagging, indexing
 pytest tests/query/                    # retrieval, CRAG, validation, guardrails
-pytest tests/eval/                     # CUAD loader/metrics, golden-set harness
-pytest tests/app/ -v                   # FastAPI integration tests
-python -m eval.cuad_preflight.run_preflight   # real 510-contract CUAD pass (needs the dataset, see below)
+pytest tests/integration/              # real qdrant-client (in-memory) round-trip
+python -m eval.cuad_preflight.chunk_quality   # 510-contract CUAD chunk-quality pass (needs the dataset)
 ```
 
 Every test runs against a fake implementing the same Protocol as the real
@@ -358,11 +378,14 @@ answer, plus a cross-tenant isolation check).
 | Metric | Value |
 |---|---|
 | Documents | 510 |
-| Avg. clauses/document | 23.1 |
+| Avg. clauses/document | 33.6 |
 | Ground-truth spans | 13,823 |
-| Boundary containment | **99.9%** (13,804 / 13,823) |
-| Straddled (clause-boundary miss) | 19 |
-| Documents still under-segmented (≤2 clauses) | 183 / 510 (36%) |
+| Boundary containment | **99.7%** (13,784 / 13,823) |
+| Straddled (clause-boundary miss) | 39 |
+| Documents still under-segmented (≤2 clauses) | 53 / 510 (10%) |
+
+(Clause level, after R13. `boundary_report.json` predates R13; the current
+passage-level numbers are in `reports/chunk_quality_r13.json`.)
 
 This pass caught two real bugs, fixed and re-validated in place rather than
 just written up:
@@ -378,6 +401,13 @@ just written up:
    "A."/"B." get reused for unrelated enumerations throughout one document,
    which would otherwise collide in the citation lookup table. Result: avg
    clauses/doc 20.7 → 23.1, under-segmented docs 42% → 36%.
+3. A third pass (R13) bucketed the 183 remaining under-segmented docs: 64
+   indented their headings, and most others were flattened text (newlines
+   lost, headings mid-line). Leading whitespace is now allowed, and an inline
+   pass — used only when fewer than 3 line headings are found, and only
+   accepting an increasing section-number sequence, which rejects
+   cross-references — finds mid-line headings. Result: under-segmented docs
+   36% → 10%, avg clauses/doc 23.1 → 33.6, containment 99.9% → 99.7%.
 
 See the docstring in `ingestion/parsing/clause_parser.py` for the full story.
 
@@ -386,17 +416,15 @@ Classification accuracy (LLM-based, against CUAD's 41 categories) is built
 costs one Groq call per clause across the whole dataset, gated behind
 `--classify` and a real `GROQ_API_KEY`.
 
-### Stage 2: Golden set (harness done, lawyer review required)
+### Stage 2: Golden set (gate done, lawyer review required)
 
-`eval/golden_set/` computes citation accuracy (near-100% blocking metric),
-claim-level attribution accuracy, retrieval recall@k, and ambiguity/refusal
-rate — but `GoldenSetReport.is_certifiable()` returns `False` if even one
-question lacks `reviewed_by`, no matter the numbers. A 6-question draft set
-against a real (public) CUAD contract is included as a starting template —
-every entry explicitly marked unreviewed. See
-[`eval/golden_set/README.md`](eval/golden_set/README.md) for the actual
-process (grounded in how real legal-AI gold-standard datasets get built:
-multi-lawyer pilot annotation, calibration, decision trees for edge cases).
+`eval/golden_set/golden.py` runs a JSONL golden set against a running
+service and computes citation accuracy (the blocking metric: default gate
+1.0, one wrong citation fails the run), refusal accuracy and answer
+coverage. `is_certifiable()` returns `False` unless the set has at least 40
+items and every one carries `reviewed_by`, whatever the numbers say.
+`golden_set.example.jsonl` (5 questions against the sample contract) is a
+format template, explicitly unreviewed.
 
 ## Guardrails & security
 

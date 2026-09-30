@@ -1,0 +1,27 @@
+MASTER SERVICES AGREEMENT
+
+This Master Services Agreement is entered into as of January 15, 2024, by and between Acme Corp, a Delaware corporation, and Globex LLC, a New York limited liability company.
+
+1. Definitions
+
+"Confidential Information" means any non-public information disclosed by either party, including business plans, customer lists, pricing, and technical specifications.
+
+2. Term
+
+The term of this Agreement consists of the Initial Term and any renewals.
+
+2.1 Initial Term
+
+The Initial Term begins on the Effective Date and continues for one (1) year, unless terminated earlier under Section 3.
+
+2.2 Renewal
+
+This Agreement renews automatically for successive one (1) year periods unless either party gives ninety (90) days' written notice of non-renewal.
+
+3. Termination
+
+Either party may terminate this Agreement for material breach on thirty (30) days' written notice, and termination does not affect the Initial Term obligations accrued under Section 2.1.
+
+4. Governing Law and Jurisdiction
+
+This Agreement is governed by the laws of the State of Delaware. The parties submit to the exclusive jurisdiction of the state and federal courts located in New York, New York.

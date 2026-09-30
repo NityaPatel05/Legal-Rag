@@ -15,3 +15,5 @@ eval/cuad_preflight/reports/
 # Immutable audit log output (query/filters/audit_log.py) -- local runtime
 # data, not source.
 audit/
+# Human review queue store (query/review/store.py) -- runtime data.
+reviews/

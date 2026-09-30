@@ -57,14 +57,16 @@ def test_route_all_valid_citations_finalizes():
     assert _route_after_validation(state) == "finalize_answered"
 
 
-def test_route_no_citations_finalizes():
+def test_route_no_citations_flags_for_review():
+    """An answer with zero claims verified nothing -- it must not be returned
+    as "answered" (the original behavior let uncited free text through)."""
     state = {"citation_results": [], "retry_count": 0}
-    assert _route_after_validation(state) == "finalize_answered"
+    assert _route_after_validation(state) == "flag_for_review"
 
 
 def test_route_invalid_citation_with_budget_remaining_retries():
     state = {"citation_results": [_valid_result(), _invalid_result()], "retry_count": 0}
-    assert _route_after_validation(state) == "rewrite_and_retrieve"
+    assert _route_after_validation(state) == "regenerate_with_feedback"
 
 
 def test_route_invalid_citation_with_budget_exhausted_strips():
@@ -227,7 +229,7 @@ def test_persistently_insufficient_context_exhausts_retries_then_flags():
     assert llm_client.generate_calls == 0
 
 
-def test_persistently_invalid_citations_exhaust_retries_then_strip():
+def test_persistently_invalid_citations_exhaust_retries_then_flag_when_nothing_survives():
     off_topic_clause = make_clause(
         "doc::c4", section_id="4", heading="Governing Law", text="This Agreement is governed by the laws of Delaware."
     )
@@ -246,10 +248,16 @@ def test_persistently_invalid_citations_exhaust_retries_then_strip():
 
     final_state = run_crag(_query_result(shown), **_common_kwargs(llm_client, vector_results=shown))
 
-    assert final_state["final_status"] == "answered_with_stripped_claims"
+    # Every claim stripped -> nothing verified is left to answer with.
+    assert final_state["final_status"] == "flagged_for_review"
+    assert final_state["final_answer_text"] is None
     assert final_state["retry_count"] == MAX_RETRIES
     assert len(final_state["stripped_claims"]) == 1
     assert final_state["kept_claims"] == []
+    # Citation failures regenerate against the same evidence; they don't
+    # rewrite the retrieval query.
+    assert llm_client.rewrite_calls == 0
+    assert llm_client.generate_calls == MAX_RETRIES + 1
 
 
 def test_ambiguous_path_logs_flagged_for_review_event():
@@ -288,7 +296,7 @@ def test_stripped_citation_path_logs_citation_stripped_event():
         audit_logger=audit_logger,
     )
 
-    assert [e.event_type for e in audit_logger.events] == ["citation_stripped"]
+    assert [e.event_type for e in audit_logger.events] == ["citation_stripped", "flagged_for_review"]
     assert audit_logger.events[0].details["stripped_claim_texts"] == ["The initial term is five years."]
 
 

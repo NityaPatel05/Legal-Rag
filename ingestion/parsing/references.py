@@ -8,10 +8,15 @@ import re
 
 from ingestion.schemas import Clause, SectionReference
 
+_NUM = r"\d+(?:\.\d+)*|[IVXLCDM]+"
+
+# Singular or plural keyword, then a list: "Section 5", "Sections 5 and 7.2",
+# "Sections 3, 4 or 9". Case-insensitive on the keyword only -- the roman
+# numeral branch must stay uppercase or "Section i" style noise creeps in.
 _REFERENCE = re.compile(
-    r"\b(?:Section|Article|Clause)\s+(?P<num>\d+(?:\.\d+)*|[IVXLCDM]+)\b",
-    re.IGNORECASE,
+    rf"\b(?i:Sections?|Articles?|Clauses?)\s+(?P<list>(?:{_NUM})(?:\s*(?:,|and|or|through)\s*(?:{_NUM})\b)*)\b",
 )
+_LIST_ITEM = re.compile(rf"(?<![\w.])(?:{_NUM})(?![\w])")
 
 
 def extract_references(clauses: list[Clause]) -> list[SectionReference]:
@@ -23,14 +28,14 @@ def extract_references(clauses: list[Clause]) -> list[SectionReference]:
         body_start = heading_line_end + 1 if heading_line_end != -1 else 0
 
         for m in _REFERENCE.finditer(clause.text, pos=body_start):
-            num = m.group("num")
-            if clause.section_id is not None and num == clause.section_id:
-                continue
-            references.append(
-                SectionReference(
-                    source_clause_id=clause.clause_id,
-                    referenced_section_id=num,
-                    raw_text=m.group(0),
+            for num in _LIST_ITEM.findall(m.group("list")):
+                if clause.section_id is not None and num == clause.section_id:
+                    continue
+                references.append(
+                    SectionReference(
+                        source_clause_id=clause.clause_id,
+                        referenced_section_id=num,
+                        raw_text=m.group(0),
+                    )
                 )
-            )
     return references

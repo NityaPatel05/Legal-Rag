@@ -2,20 +2,36 @@
 single retrieval call: the citation validator's `exists` check
 (query/validation/citation_validator.py) needs the FULL document's clause
 list, not just what was retrieved for one query, and reference-expansion
-(query/retrieval/reference_expansion.py) needs a section_id -> clause lookup
-AND the section-reference graph covering the whole document too. All three
-are rebuilt here from a single scroll over every point belonging to one
-document, filtered by tenant_id/matter_id for the same permission-first
-reason as every other read path in this codebase (CLAUDE.md #7) — clause
-points and reference points share a collection (see indexer.py's
-upsert_references) and are told apart by their `record_type` payload field.
+(query/retrieval/reference_expansion.py) needs a section_id -> clause lookup,
+the section-reference graph and the defined-terms table covering the whole
+document too. All are rebuilt here from a single scroll over every point
+belonging to one document, filtered by tenant_id/matter_id for the same
+permission-first reason as every other read path in this codebase
+(CLAUDE.md #7) — clause, reference and defined-term points share a
+collection (see indexer.py) and are told apart by their `record_type`
+payload field.
+
+Two details that matter for correctness:
+
+- Scroll returns points in point-id (uuid) order, not document order, so
+  clauses are re-sorted by start_offset.
+- by_section_id only contains section ids that resolve to ONE clause.
+  Real contracts reuse numbering (an exhibit restarting at "1."), and a
+  last-write-wins dict would silently map "Section 1" to whichever clause
+  happened to scroll last. Passages split from one clause share its
+  section_id; those resolve to the first passage (the one with the heading),
+  since that's still unambiguous. A genuinely ambiguous id is left out: an
+  expansion that doesn't happen is safer than one that pulls in the wrong
+  clause.
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from collections import defaultdict
 
-from ingestion.schemas import Clause, ClauseMetadata, SectionReference
+from pydantic import BaseModel, Field
+
+from ingestion.schemas import Clause, ClauseMetadata, DefinedTerm, SectionReference
 
 
 class DocumentContext(BaseModel):
@@ -23,9 +39,31 @@ class DocumentContext(BaseModel):
     clause_metadata_by_id: dict[str, ClauseMetadata]
     by_section_id: dict[str, tuple[Clause, ClauseMetadata]]
     references: list[SectionReference]
+    defined_terms: list[DefinedTerm] = Field(default_factory=list)
 
     def bm25_corpus(self) -> list[tuple[Clause, ClauseMetadata]]:
         return [(clause, self.clause_metadata_by_id[clause.clause_id]) for clause in self.clauses]
+
+    def by_clause_id(self) -> dict[str, tuple[Clause, ClauseMetadata]]:
+        return {c.clause_id: (c, self.clause_metadata_by_id[c.clause_id]) for c in self.clauses}
+
+
+def build_section_lookup(
+    clauses: list[Clause], metadata_by_id: dict[str, ClauseMetadata]
+) -> dict[str, tuple[Clause, ClauseMetadata]]:
+    groups: dict[str, list[Clause]] = defaultdict(list)
+    for clause in clauses:
+        if clause.section_id:
+            groups[clause.section_id].append(clause)
+
+    lookup: dict[str, tuple[Clause, ClauseMetadata]] = {}
+    for section_id, group in groups.items():
+        owners = {c.parent_clause_id or c.clause_id for c in group}
+        if len(owners) != 1:
+            continue  # ambiguous: two different clauses claim this number
+        first = min(group, key=lambda c: c.start_offset)
+        lookup[section_id] = (first, metadata_by_id[first.clause_id])
+    return lookup
 
 
 class QdrantDocumentReader:
@@ -61,8 +99,8 @@ class QdrantDocumentReader:
 
         clauses: list[Clause] = []
         clause_metadata_by_id: dict[str, ClauseMetadata] = {}
-        by_section_id: dict[str, tuple[Clause, ClauseMetadata]] = {}
         references: list[SectionReference] = []
+        defined_terms: list[DefinedTerm] = []
 
         offset = None
         while True:
@@ -72,27 +110,32 @@ class QdrantDocumentReader:
                 limit=256,
                 offset=offset,
                 with_payload=True,
+                with_vectors=False,
             )
             for point in points:
                 # Payloads written before record_type existed have neither
                 # field -- default to "clause" so old data doesn't silently
                 # vanish from a re-deployed reader.
-                if point.payload.get("record_type", "clause") == "reference":
+                record_type = point.payload.get("record_type", "clause")
+                if record_type == "reference":
                     references.append(_point_to_reference(point.payload))
+                    continue
+                if record_type == "defined_term":
+                    defined_terms.append(_point_to_defined_term(point.payload))
                     continue
                 clause, metadata = _point_to_clause_and_metadata(point.payload)
                 clauses.append(clause)
                 clause_metadata_by_id[clause.clause_id] = metadata
-                if clause.section_id:
-                    by_section_id[clause.section_id] = (clause, metadata)
             if offset is None:
                 break
 
+        clauses.sort(key=lambda c: (c.start_offset, c.clause_id))
         return DocumentContext(
             clauses=clauses,
             clause_metadata_by_id=clause_metadata_by_id,
-            by_section_id=by_section_id,
+            by_section_id=build_section_lookup(clauses, clause_metadata_by_id),
             references=references,
+            defined_terms=defined_terms,
         )
 
 
@@ -104,6 +147,7 @@ def _point_to_clause_and_metadata(payload: dict) -> tuple[Clause, ClauseMetadata
         text=payload["text"],
         start_offset=payload.get("start_offset", 0),
         end_offset=payload.get("end_offset", 0),
+        parent_clause_id=payload.get("parent_clause_id"),
     )
     metadata_fields = {k: v for k, v in payload.items() if k in ClauseMetadata.model_fields}
     metadata = ClauseMetadata(**metadata_fields)
@@ -115,4 +159,12 @@ def _point_to_reference(payload: dict) -> SectionReference:
         source_clause_id=payload["source_clause_id"],
         referenced_section_id=payload["referenced_section_id"],
         raw_text=payload["raw_text"],
+    )
+
+
+def _point_to_defined_term(payload: dict) -> DefinedTerm:
+    return DefinedTerm(
+        term=payload["term"],
+        definition=payload["definition"],
+        defined_in_clause_id=payload["defined_in_clause_id"],
     )

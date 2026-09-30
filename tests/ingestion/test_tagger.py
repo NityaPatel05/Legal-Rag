@@ -53,8 +53,9 @@ def test_jurisdiction_and_governing_law_land_in_separate_fields():
         llm_client=llm_client,
     )
 
-    assert metadata.jurisdiction == "New York"
-    assert metadata.governing_law == "Delaware"
+    # normalized to the canonical filter key (ingestion/metadata/normalize.py)
+    assert metadata.jurisdiction == "new york"
+    assert metadata.governing_law == "delaware"
     assert metadata.jurisdiction != metadata.governing_law
     assert metadata.effective_date == date(2024, 1, 15)
 
@@ -107,3 +108,55 @@ def test_missing_optional_fields_default_safely():
     assert metadata.contains_pii is False
     assert metadata.jurisdiction is None
     assert metadata.governing_law is None
+
+
+def test_tag_and_enrich_clause_returns_metadata_and_note_from_one_call():
+    from ingestion.metadata.tagger import tag_and_enrich_clause
+
+    class OneShotLLM:
+        def __init__(self):
+            self.calls = []
+
+        def generate_json(self, system_prompt, user_prompt):
+            self.calls.append(user_prompt)
+            return {
+                "clause_type": "Governing Law",
+                "governing_law": "State of Delaware",
+                "jurisdiction": "New York",
+                "context_note": "Section 4 of the Acme / Globex MSA; sets governing law.",
+            }
+
+    llm = OneShotLLM()
+    clause = Clause(
+        clause_id="doc::clause-004", section_id="4", heading="Governing Law",
+        text="This Agreement is governed by the laws of the State of Delaware.",
+        start_offset=0, end_offset=64,
+    )
+    metadata, note = tag_and_enrich_clause(
+        clause, tenant_id="t", matter_id="m", privilege_level=PrivilegeLevel.CONFIDENTIAL,
+        llm_client=llm, document_summary="MSA between Acme and Globex.", document_outline="4 Governing Law",
+    )
+
+    assert len(llm.calls) == 1
+    assert "MSA between Acme and Globex." in llm.calls[0]
+    assert "4 Governing Law" in llm.calls[0]
+    assert metadata.clause_type == "Governing Law"
+    assert metadata.governing_law == "delaware"
+    assert metadata.jurisdiction == "new york"
+    assert note == "Section 4 of the Acme / Globex MSA; sets governing law."
+
+
+def test_tag_and_enrich_clause_tolerates_a_missing_or_blank_note():
+    from ingestion.metadata.tagger import tag_and_enrich_clause
+
+    class NoNoteLLM:
+        def generate_json(self, system_prompt, user_prompt):
+            return {"clause_type": "not-a-real-label", "context_note": "   "}
+
+    clause = Clause(clause_id="d::clause-000", section_id=None, heading=None, text="x", start_offset=0, end_offset=1)
+    metadata, note = tag_and_enrich_clause(
+        clause, tenant_id="t", matter_id="m", privilege_level=PrivilegeLevel.CONFIDENTIAL, llm_client=NoNoteLLM(),
+    )
+
+    assert note is None
+    assert metadata.clause_type in (None, "Other")

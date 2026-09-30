@@ -7,8 +7,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# CPU torch wheel first -- pip's default Linux torch is the CUDA build
+# (several GB of nvidia-* wheels) and compose runs this on CPU. For a GPU
+# host, drop this line and add a GPU reservation to docker-compose.yml.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch --index-url https://download.pytorch.org/whl/cpu
+
 COPY embedding_server/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
 COPY embedding_server/main.py .
 

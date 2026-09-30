@@ -2,7 +2,10 @@
 # deployment section for the ingest -> query smoke test.
 services:
   qdrant:
-    image: qdrant/qdrant:v1.12.4
+    # Keep the server's minor version in step with the installed
+    # qdrant-client (1.18): the client warns on a >1 minor-version gap and
+    # the app uses query_points/prefetch APIs added in newer servers.
+    image: qdrant/qdrant:v1.18.3
     ports:
       - "6333:6333"
     volumes:
@@ -24,14 +27,18 @@ services:
       # 8080, since that's Docker-network-internal and unaffected by the
       # host remap.
       - "8081:8080"
+    volumes:
+      # BGE-M3 weights (~2GB) survive container rebuilds.
+      - hf_cache:/root/.cache/huggingface
     healthcheck:
+      # /health is 503 until the model has loaded (see embedding_server/main.py).
       # python, not curl/wget -- python:3.11-slim doesn't ship either, but
       # definitely has python since that's the base image itself.
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
-      interval: 30s
+      interval: 15s
       timeout: 10s
       retries: 3
-      start_period: 180s # first /embed call downloads the ~2GB BGE-M3 model
+      start_period: 600s # cold start downloads + loads the ~2GB BGE-M3 model
 
   app:
     build:
@@ -47,11 +54,20 @@ services:
       QDRANT_URL: http://qdrant:6333
       BGE_M3_ENDPOINT: http://embedding-server:8080
       AUDIT_LOG_PATH: /app/audit/audit.jsonl
+      REVIEW_DB_PATH: /app/reviews/reviews.sqlite3
+      # .env must set API_KEYS: the app refuses to start without it, and
+      # DEV_MODE (loopback-only) can't work here -- host requests reach the
+      # container over the Docker bridge, not loopback.
     depends_on:
-      - qdrant
-      - embedding-server
+      qdrant:
+        condition: service_started
+      embedding-server:
+        # Not just started: the model must be loaded, or the first ingest's
+        # /embed call outlives BGEM3Embedder's 30s timeout.
+        condition: service_healthy
     volumes:
       - audit_logs:/app/audit
+      - review_queue:/app/reviews  # human review queue (SQLite) survives restarts
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 15s
@@ -62,3 +78,5 @@ services:
 volumes:
   qdrant_data:
   audit_logs:
+  review_queue:
+  hf_cache:

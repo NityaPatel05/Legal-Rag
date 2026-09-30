@@ -1,0 +1,8 @@
+# EXAMPLE ONLY -- written against tests/ingestion/fixtures/sample_contract.txt
+# ingested as document_id "sample-msa". Not lawyer-reviewed (reviewed_by is
+# null), so is_certifiable() refuses it. The real set: 40-80 reviewed items.
+{"id": "ex-001", "tenant_id": "dev-tenant", "matter_id": "dev-matter", "document_id": "sample-msa", "question": "Which state's law governs this agreement?", "acceptable_clause_ids": ["sample-msa::clause-006"], "answer_must_contain": ["Delaware"]}
+{"id": "ex-002", "tenant_id": "dev-tenant", "matter_id": "dev-matter", "document_id": "sample-msa", "question": "Which courts have exclusive jurisdiction?", "acceptable_clause_ids": ["sample-msa::clause-006"], "answer_must_contain": ["New York"]}
+{"id": "ex-003", "tenant_id": "dev-tenant", "matter_id": "dev-matter", "document_id": "sample-msa", "question": "How much notice is required to prevent automatic renewal?", "acceptable_clause_ids": ["sample-msa::clause-004"], "answer_must_contain": ["ninety"]}
+{"id": "ex-004", "tenant_id": "dev-tenant", "matter_id": "dev-matter", "document_id": "sample-msa", "question": "How long is the initial term?", "acceptable_clause_ids": ["sample-msa::clause-003"], "answer_must_contain": ["one (1) year"]}
+{"id": "ex-005", "tenant_id": "dev-tenant", "matter_id": "dev-matter", "document_id": "sample-msa", "question": "What is the cap on each party's liability?", "expect_refusal": true, "notes": "The sample contract has no limitation-of-liability clause."}

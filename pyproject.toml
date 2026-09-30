@@ -1,7 +1,7 @@
 [project]
 name = "legal-contract-rag"
 version = "0.0.1"
-description = "Clause-level RAG system for legal contract analysis (scaffold only, no implementation yet)."
+description = "Clause-level RAG system for legal contract analysis with deterministic citation validation."
 readme = "README.md"
 requires-python = ">=3.11"
 
@@ -23,6 +23,7 @@ dependencies = [
     "cohere",             # reranker
     "docling",
     "groq",               # LLM provider: metadata tagging, context enrichment, jailbreak classifier
+    "httpx",              # OpenAICompatibleLLMClient: self-hosted LLM for privileged documents
     "rank_bm25",           # keyword-search half of hybrid retrieval
     "ragas",
     "datasets",           # CUAD loading
@@ -37,6 +38,11 @@ dev = [
     "pytest",
     "pytest-cov",
     "ruff",
+]
+# Citation validator entailment layer (roadmap R6; enabled by NLI_MODEL).
+# requirements.txt (the Docker image) installs it unconditionally.
+nli = [
+    "sentence-transformers",
 ]
 # Later swap-in once pipeline logic is validated (see architecture.md §8)
 voyage = [

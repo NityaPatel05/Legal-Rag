@@ -16,6 +16,7 @@ from query.validation.citation_validator import CitationValidationResult
 class Claim(BaseModel):
     claim_text: str
     citation_section_id: str
+    supporting_quote: str | None = None
 
 
 class StripResult(BaseModel):

@@ -10,7 +10,7 @@ def test_both_fields_produce_independent_conditions():
     conditions = build_jurisdiction_governing_law_filter(filters)
 
     fields = {c.field: c.value for c in conditions}
-    assert fields == {"jurisdiction": "New York", "governing_law": "Delaware"}
+    assert fields == {"jurisdiction": "new york", "governing_law": "delaware"}
 
 
 def test_jurisdiction_only_does_not_implicitly_scope_governing_law():

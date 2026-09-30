@@ -3,28 +3,46 @@ CLAUDE.md's hybrid-search decision. RRF over raw score blending because
 vector cosine similarity and BM25 scores live on incomparable scales; RRF
 only needs each list's rank order, not comparable magnitudes.
 
-Applies the permission filter (CLAUDE.md #7, pre-retrieval, primary control)
-via the vector search call, then re-checks every candidate — including BM25
-results, which have no per-query filter of their own (see bm25_search.py) —
-before fusion. Anything that doesn't match the requesting tenant/matter is
-dropped here rather than silently fused in.
+Every filter condition -- permission, jurisdiction/governing-law, document
+scope -- is passed to the vector search call (pre-retrieval, the primary
+control), and the SAME predicate list is applied to BM25 hits before
+fusion. BM25 has no per-query filter of its own (see bm25_search.py): the
+original version re-checked only tenant/matter on BM25 hits, so a
+`governing_law=delaware` query still fused in keyword hits from a
+California-law contract in the same matter.
 """
 
 from __future__ import annotations
 
-from query.filters.jurisdiction_governing_law import build_jurisdiction_governing_law_filter
+from ingestion.embedding.indexer import document_id_from_clause_id
+from query.filters.jurisdiction_governing_law import (
+    build_document_filter,
+    build_jurisdiction_governing_law_filter,
+)
 from query.filters.permission import build_permission_filter
 from query.retrieval.bm25_search import BM25Index
 from query.retrieval.vector_search import VectorSearchClient
-from query.schemas import PermissionContext, QueryFilters, RetrievedClause
+from query.schemas import FilterCondition, PermissionContext, QueryFilters, RetrievedClause
 
 _RRF_K = 60
 
 
-def _matches_permission(retrieved: RetrievedClause, context: PermissionContext) -> bool:
+def _field_value(retrieved: RetrievedClause, field: str):
+    if field == "document_id":
+        return document_id_from_clause_id(retrieved.clause.clause_id)
+    value = getattr(retrieved.metadata, field, None)
+    return value.value if hasattr(value, "value") else value
+
+
+def matches_all(retrieved: RetrievedClause, conditions: list[FilterCondition]) -> bool:
+    return all(_field_value(retrieved, c.field) == c.value for c in conditions)
+
+
+def build_filters(permission_context: PermissionContext, query_filters: QueryFilters) -> list[FilterCondition]:
     return (
-        retrieved.metadata.tenant_id == context.tenant_id
-        and retrieved.metadata.matter_id == context.matter_id
+        build_permission_filter(permission_context)
+        + build_jurisdiction_governing_law_filter(query_filters)
+        + build_document_filter(query_filters)
     )
 
 
@@ -38,15 +56,15 @@ def hybrid_retrieve(
     top_k: int,
     candidate_pool_size: int = 20,
 ) -> list[RetrievedClause]:
-    filters = build_permission_filter(permission_context) + build_jurisdiction_governing_law_filter(
-        query_filters
-    )
+    filters = build_filters(permission_context, query_filters)
 
+    # Vector results are NOT silently post-filtered: the store already
+    # applied these predicates, so a mismatch there means the primary control
+    # failed, and process_query's assert_permission must see it and fail
+    # loudly (and audit it) rather than have it quietly dropped here.
     vector_results = vector_client.search(query_text, filters=filters, top_k=candidate_pool_size)
     bm25_results = [
-        r
-        for r in bm25_index.search(query_text, top_k=candidate_pool_size)
-        if _matches_permission(r, permission_context)
+        r for r in bm25_index.search(query_text, top_k=candidate_pool_size) if matches_all(r, filters)
     ]
 
     rrf_scores: dict[str, float] = {}

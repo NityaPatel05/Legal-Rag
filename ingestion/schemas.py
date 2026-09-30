@@ -23,6 +23,9 @@ class Clause(BaseModel):
     text: str
     start_offset: int
     end_offset: int
+    # Set only on passages produced by split_oversize_clauses: the clause this
+    # passage was cut from. A passage never crosses its parent's boundaries.
+    parent_clause_id: str | None = None
 
 
 class DefinedTerm(BaseModel):
@@ -62,6 +65,10 @@ class ClauseMetadata(BaseModel):
     privilege_level: PrivilegeLevel = PrivilegeLevel.CONFIDENTIAL
     contains_pii: bool = False
     supersession_links: list[str] = Field(default_factory=list)
+    # Set deterministically at ingestion (metadata/injection_scan.py), never
+    # by the LLM: clause text that reads like instructions to a model.
+    injection_suspected: bool = False
+    injection_markers: list[str] = Field(default_factory=list)
 
 
 class TaggedClause(BaseModel):

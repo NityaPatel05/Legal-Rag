@@ -27,6 +27,10 @@ docling
 
 # --- LLM provider (metadata tagging, context enrichment, jailbreak classifier) ---
 groq                     # free-tier hosted inference, default model: openai/gpt-oss-120b
+httpx                    # OpenAICompatibleLLMClient: self-hosted LLM for privileged documents (R9)
+
+# --- Citation validator: optional NLI entailment layer (R6, NLI_MODEL) ---
+sentence-transformers    # CrossEncoder; imported only when NLI_MODEL is set
 
 # --- Hybrid retrieval ---
 rank_bm25                # keyword-search half of hybrid retrieval
