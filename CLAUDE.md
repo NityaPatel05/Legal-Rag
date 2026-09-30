@@ -33,18 +33,20 @@ Windows note: Python 3.13 (Anaconda) on this machine; tests run fine from Git Ba
 
 | Stage | File |
 |---|---|
+| Text normalization (CRLF/NBSP/zero-width/NFKC) | `ingestion/parsing/text_normalize.py` |
 | Clause parsing + passage split | `ingestion/parsing/clause_parser.py` (`parse_clauses`, `split_oversize_clauses`) |
 | Defined terms / cross-refs | `ingestion/parsing/defined_terms.py`, `references.py` |
 | Document-level metadata + summary | `ingestion/metadata/document_profile.py` |
-| Per-clause metadata | `ingestion/metadata/tagger.py`; place-name gazetteer `normalize.py`; clause/contract-type vocabularies `vocabulary.py` |
+| Per-clause metadata (batched, 8 passages/call) | `ingestion/metadata/tagger.py` (`tag_and_enrich_clauses`); place-name gazetteer + grounding `normalize.py`; clause/contract-type vocabularies `vocabulary.py` |
+| LLM clients, retry policy, response cache | `ingestion/metadata/llm_client.py`; untrusted-output coercion `llm_output.py` |
 | Injection scan (ingestion) | `ingestion/metadata/injection_scan.py` |
 | Context note | `ingestion/embedding/context_enrichment.py` |
 | Index / read back | `ingestion/embedding/indexer.py`, `document_reader.py` |
 | Orchestration (ingest) | `ingestion/pipeline.py` |
-| Guardrails | `query/filters/` (PII, jailbreak, permission, jurisdiction, audit log) |
+| Guardrails | `query/filters/` (PII, input screen = jailbreak + router in one call `query_screen.py`, permission, jurisdiction, audit log) |
 | Retrieval | `query/retrieval/` (vector, BM25, RRF hybrid, rerank, expansion, reorder, sibling-passage context `passage_context.py`) |
-| Retrieval orchestration | `query/pipeline.py` (`process_query`, B1–B7) |
-| Generation + CRAG loop | `query/generation/crag_graph.py` (`run_crag`, B8–B15) |
+| Retrieval orchestration | `query/pipeline.py` (`process_query`; `retrieve()` is the only retrieval path, also used by CRAG rewrites) |
+| Generation + CRAG loop | `query/generation/answer_generator.py` (answers AND grades the evidence), `crag_graph.py` (`run_crag`) |
 | Citation validation | `query/validation/citation_validator.py` (+ optional NLI `EntailmentChecker`), `strip_unsupported.py` |
 | Human review queue | `query/review/` (`workflow.py` queue + decisions, `store.py` SQLite/in-memory, `schemas.py` evidence packet); routes `/reviews` in `app/main.py` |
 | HTTP | `app/main.py`, `app/dependencies.py` (auth + privileged-LLM selection live here) |
@@ -64,7 +66,11 @@ Windows note: Python 3.13 (Anaconda) on this machine; tests run fine from Git Ba
    quote's enclosing sentence, not the whole clause.
 4. **Only validated claims reach the user.** `QueryResponse.answer_text` is
    composed from kept claims (`final_answer_text`); the model's free-text
-   `answer_text` is never returned. Zero claims ⇒ `flagged_for_review`.
+   `answer_text` is never returned. Zero claims ⇒ `flagged_for_review`,
+   except `not_found` (every retrieval graded insufficient, nothing claimed),
+   whose text is a fixed string (`crag_graph.NOT_FOUND_TEXT`). The only other
+   generated content returned is `verdict`, a closed-set enum rendered as a
+   fixed sentence, and only when kept claims ground ≥ 2 different clauses.
 5. **`jurisdiction` and `governing_law` are separate fields**, extracted and
    filtered independently, stored **normalized** (`normalize_place`), and
    are **document-level** (merged onto every clause from the document profile;
@@ -77,11 +83,16 @@ Windows note: Python 3.13 (Anaconda) on this machine; tests run fine from Git Ba
    body, whenever `API_KEYS` is configured (`app/dependencies.authorize_request`;
    a scoped key lists its matters, deny by default).
 8. **Point IDs are scoped by tenant+matter** (`uuid5(tenant, matter, clause_id)`),
-   and re-ingest is delete-then-write.
+   and re-ingest is **write-then-delete-stale**: every point carries
+   `ingest_version` (content hash); the new version is upserted, then points
+   with any other version are deleted. Unchanged content (same version) is
+   skipped entirely. A re-ingest may not lower `privilege_level` (409).
 9. **Queries are scoped to one `document_id`** (`QueryFilters.document_id`) —
    BM25, the validator's `exists` check and expansion are all per-document.
 10. **Retry budget is shared** (`MAX_RETRIES=2`) across "insufficient →
-    rewrite+retrieve" and "citation invalid → regenerate with feedback".
+    retrieve again" and "citation invalid → regenerate with feedback". A
+    rewrite only drives retrieval: generation always answers the ORIGINAL
+    question, and new evidence is added to (not swapped for) the old.
 11. **LLM output is untrusted input**: parse defensively (bad dates → `None`,
     malformed claims → empty citation that fails validation, never a 500).
 12. **What leaves the boundary.** Structured PII is redacted from every prompt
@@ -101,6 +112,20 @@ Windows note: Python 3.13 (Anaconda) on this machine; tests run fine from Git Ba
     every approved/edited claim against the document as stored *now*; a
     failing claim needs an `override_reason` and is audited as
     `review_override`. Every draft claim needs its own decision (no approve-all).
+16. **LLM call budget.** Ingest = 1 profile call + ⌈passages / 8⌉ tagging
+    calls (0 for unchanged content). Query = 1 screen call + 1 generator call
+    on the happy path, at most 2 + `MAX_RETRIES`; no call when retrieval is
+    empty. Pinned by `tests/app/test_api.py::test_llm_call_budget_*` — don't
+    add a per-clause or per-stage LLM call without changing that test on
+    purpose.
+17. **LLM-extracted places are grounded.** A clause's jurisdiction /
+    governing_law is kept only if that clause's text names the place; the
+    document profile's only if a governing-law / venue sentence names it
+    (`normalize.place_mentioned`). Batched prompts put several
+    counterparty-authored clauses together; this stops one steering another.
+18. **Guardrails fail closed.** A missing / malformed screen verdict is
+    "flagged"; a missing evidence grade is "ambiguous". Coerce model JSON
+    with `llm_output.as_bool(default=...)`, never `bool()`.
 
 ## Conventions
 
@@ -113,9 +138,13 @@ Windows note: Python 3.13 (Anaconda) on this machine; tests run fine from Git Ba
 - Module docstrings explain *why* (with measured numbers where they exist).
   Keep that style; update the docstring when the reasoning changes.
 - Fake LLM clients dispatch on system-prompt phrases. Keep these phrases stable
-  or update the fakes: `"legal contract analysis assistant"` (generator),
-  `"enough to answer"` (sufficiency), `"Rewrite the question"` (rewriter),
-  `"context note"` (enrichment).
+  or update the fakes: `"legal contract analysis assistant"` (generator; the
+  response also carries `sufficiency`, `search_query`, `verdict`),
+  `"input screen"` (jailbreak verdict + route), `"context note"` (batched
+  tagging: clauses in `<clause-NONCE id="cN">` tags, response
+  `{"clauses": [{"id": "c1", ...}]}`), `"document-level metadata"` (profile).
+- Retries: only 429 / 408 / 409 / 5xx / timeouts / bad JSON (`llm_client.is_retryable`);
+  honour Retry-After. Upstream failures surface as HTTP 503, not 500.
 
 ## Configuration added in the review (add to `.env.example`)
 
@@ -137,6 +166,12 @@ PRIVILEGED_LLM_MODEL=
 PRIVILEGED_LLM_API_KEY=
 NLI_MODEL=                   # e.g. cross-encoder/nli-deberta-v3-base; empty = entailment layer off (R6)
 NLI_ENTAILMENT_THRESHOLD=0.5
+INGEST_BATCH_SIZE=8          # passages per tagging call
+LLM_CACHE_PATH=./llm_cache/llm_cache.sqlite3   # empty = no response cache
+LLM_CACHE_MAX_AGE_DAYS=30
+LLM_MAX_ATTEMPTS=4
+GROQ_REASONING_EFFORT=       # low | medium | high (gpt-oss); empty = provider default
+QDRANT_API_KEY=              # required by docker compose
 ```
 
 ---
@@ -190,7 +225,48 @@ the local CUAD data and the literature. **F** = fixed in this pass, **O** = open
 | L16 | LLM client: no retries/backoff/timeouts; ~2 calls per clause guarantees free-tier 429s mid-ingest. Invalid LLM dates crashed ingestion. | — | F |
 | L17 | Embedding server forced fp16 (bad on CPU), no `max_length`/batch control. | — | F |
 | L18 | Docs claimed files that don't exist: `eval/golden_set/`, CUAD pre-flight runner, `tests/eval/`, `tests/app/`, and this CLAUDE.md. | — | F → `eval/retrieval/`, `eval/golden_set/`, `tests/eval/`, `tests/app/` built; pre-flight runner still absent |
-| L19 | Negation check is scoped to the quote's whole sentence, so a correct claim is **rejected** when an unrelated clause of the same sentence is negated: "Either party may terminate … for material breach" fails on "…, and termination does **not** affect …" (fixture §3). Deliberate trade-off (stops a claim dropping a "not" just outside the quote), but it costs recall. Candidate fix: scope negation to the quote's own clause segment (split on `, and` / `;`), or let the R6 NLI layer own negation. | `tests/app` found it | **O** |
+| L19 (F 2026-09-30) | Negation check is scoped to the quote's whole sentence, so a correct claim is **rejected** when an unrelated clause of the same sentence is negated: "Either party may terminate … for material breach" fails on "…, and termination does **not** affect …" (fixture §3). Deliberate trade-off (stops a claim dropping a "not" just outside the quote), but it costs recall. Candidate fix: scope negation to the quote's own clause segment (split on `, and` / `;`), or let the R6 NLI layer own negation. | `tests/app` found it | **O** |
+
+### Review findings (2026-09-30) — all fixed
+
+Second full review (5 review sessions: architecture, code, security,
+testing, RAG). IDs are from that review, not the table above.
+
+| # | Finding | Fix |
+|---|---|---|
+| B1 | CRAG rewrite path re-retrieved without the permission assertion / audit / trace | shared `query/pipeline.retrieve()`; `assert_permission` also checks `document_id` |
+| B2 | After a rewrite, the rewritten ("more general") query was answered | generation always uses the original question |
+| B3 | A rewrite replaced earlier evidence | union by clause_id, best score, capped at 40 |
+| B4 | Number check: `$1 million` = `$1 billion`, `2.5%` = `5.2%`, `30 months` = `30 days` | whole amounts → Decimal + unit; section numbers ignored |
+| B5 | Quote matched at its first occurrence only | repeated quote in different sentences ⇒ "ambiguous, quote more context" |
+| B6 | may/shall and party swaps passed; negation too coarse | modal classes, party + obligor check, segment-scoped negation, "not … except" carve-outs (also L19) |
+| B7 | Wrapped "…in\nSection 3 hereof" started a clause | wrapped-line + numbering guards |
+| B8 | References on a clause's first line were skipped; no ranges | fixed; "Sections 5 through 9" expands (cap 20). CUAD refs 8,252 → 13,782 |
+| B9 | Jailbreak classifier failed open; echoed model text | `query_screen.py` fails closed; fixed client message |
+| B10 | Contradiction verdict never reached the user | closed-set `verdict` → fixed sentence + `QueryResponse.verdict` |
+| B11 | "No such clause" could never be answered | `not_found` status (fixed text, still queued for review) |
+| B12 | LangSmith outage ⇒ every /query 500; raw query exported | try/except + hashes only |
+| B13–B15 | Empty ingest 500 after a wasted call; one 30 s embed request for the whole doc; delete-then-write lost the doc on failure | refuse before any call (422); embed batches of 32 with retry; write-then-delete-stale |
+| B16 | Concurrent review decisions both won | conditional `UPDATE … WHERE status='open'` ⇒ 409 |
+| B17, B20 | CRLF / NBSP / form feed / Docling markdown broke heading detection | `text_normalize.py`, markdown heading strip |
+| B18 | Route labels case-sensitive; `bool("false")` | `llm_output` coercion |
+| B19 | Wrong flag reason (ambiguous vs no claims) | no-claims checked first |
+| B21 | 400/401 retried with ~14 s backoff; Retry-After ignored | retry policy above |
+| B22 | No exception handlers, no logging | 503 + Retry-After / 422 / 409 / 403 handlers; `logging` |
+| B23 | No input limits | field caps + ID pattern; embed server caps |
+| S1 | Qdrant / embedder published on 0.0.0.0, no Qdrant key | loopback binds, `QDRANT__SERVICE__API_KEY` |
+| S2 | Privileged text sent to Cohere when reranking on | passthrough reranker for privileged docs |
+| S3 | Re-ingest could downgrade privilege | refused (409) |
+| S4 | Forgeable clause delimiters; scan after tagging; injected places spread doc-wide | hashed-nonce tags, scan first (NFKC, zero-width), flagged clauses tagged alone, place grounding (#17) |
+| S5 | PII regex missed spaced SSNs, cards, IBAN, email, phone | added (Luhn / mod-97 checked) |
+| S6 | Root containers, unpinned deps, langsmith CVE-2026-25528 | non-root, pins, BGE-M3 revision, `langsmith>=0.6.3` |
+| S7 | Audit log had no actor, stored claim text | hashed-key `actor`; hashes not text |
+| L1–L12 | `_pack` infinite loop; `/reviews` status; unclosed SQLite; NLI StopIteration; privileged text redacted for the self-hosted model; "Inc." cut definitions; blocking startup sleep; stopword BM25 matches; RRF double-count; dead code; unused deps | all fixed |
+
+**LLM calls** (the other half of that pass): ingest 1 + n → 1 + ⌈n/8⌉
+(CUAD average ~83 → ~12), 0 for unchanged content; query 4 → 2 on the happy
+path (worst case ~8 → 4); SQLite response cache namespaced per tenant +
+matter + model. See invariant #16.
 
 ---
 
@@ -324,8 +400,13 @@ and a comparison route that retrieves across versions of one agreement.
 **R12 — Throughput.** Merge per-clause tag + enrich into one LLM call (halves
 ingestion calls); batch clauses per call; async ingestion job instead of a
 synchronous `POST /documents/text`; expose Docling upload.
+*Status 2026-09-30:* merge + batching **done** (8 passages/call), plus the
+response cache and unchanged-content skip. **Open:** async job, Docling
+upload, bounded concurrency behind a token-bucket limiter.
 
-**R13 — Clause parser residuals.** 183/510 CUAD docs (36%) still parse to
+**R13 — Clause parser residuals.** (2026-09-30: 53/510 docs at ≤ 2 clauses
+after the R13 + B7/B17 parser changes; the 183 below is the older count.)
+183/510 CUAD docs (36%) still parse to
 ≤ 2 clauses; passage splitting keeps them retrievable but uncitable by
 section. Sample those docs, bucket the causes (Docling/markdown headings,
 `Section 1.01` forms, tabular exhibits), fix the largest bucket, re-run
