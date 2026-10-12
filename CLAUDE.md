@@ -20,11 +20,13 @@ pytest tests/                                   # full suite, no live services (
 pytest tests/query/test_citation_validator.py   # single file while iterating
 pytest tests/integration/                       # real qdrant-client, in-memory mode
 pytest tests/app/                               # HTTP: real app + in-memory Qdrant, fake LLM/embedder
+pytest tests/ui/                                # Streamlit pages (AppTest) against the real app + render unit tests
 python -m eval.cuad_preflight.chunk_quality     # CUAD chunk quality (needs CUAD_v1.json in CUAD_DATA_DIR)
 python -m eval.retrieval.cuad_recall            # CUAD retrieval hit@k / span recall@k (BM25; --retriever hybrid --embed-url for dense)
 python -m eval.golden_set.golden <set.jsonl> --base-url http://localhost:8000   # golden-set gate vs a running service
 uvicorn app.main:app --reload                   # needs Qdrant + embedding server + GROQ_API_KEY
 docker compose up --build                       # full stack (never verified end to end — see Open issues)
+cd ui && streamlit run streamlit_app.py         # web UI on localhost:8501 (pip install -r ui/requirements.txt; RAG_API_URL / RAG_API_KEY)
 ```
 
 Windows note: Python 3.13 (Anaconda) on this machine; tests run fine from Git Bash.
@@ -49,7 +51,8 @@ Windows note: Python 3.13 (Anaconda) on this machine; tests run fine from Git Ba
 | Generation + CRAG loop | `query/generation/answer_generator.py` (answers AND grades the evidence), `crag_graph.py` (`run_crag`) |
 | Citation validation | `query/validation/citation_validator.py` (+ optional NLI `EntailmentChecker`), `strip_unsupported.py` |
 | Human review queue | `query/review/` (`workflow.py` queue + decisions, `store.py` SQLite/in-memory, `schemas.py` evidence packet); routes `/reviews` in `app/main.py` |
-| HTTP | `app/main.py`, `app/dependencies.py` (auth + privileged-LLM selection live here) |
+| HTTP | `app/main.py`, `app/dependencies.py` (auth + privileged-LLM selection live here); UI-facing routes: `/documents` list/detail/file upload, `/reviews/{id}/status` (asker poll), `/reviews/{id}/check` (dry-run validation, `workflow.check_claims`) |
+| Web UI | `ui/` (Streamlit, separate deployable, HTTP only — imports nothing from the backend): `streamlit_app.py` nav + sidebar, `views/` ask / review / documents, `api.py` client, `render.py` escaping + quote highlight, `state.py` per-session cache |
 | Eval | `eval/retrieval/cuad_recall.py` (R1), `eval/golden_set/golden.py` (R2), `eval/cuad_preflight/chunk_quality.py` |
 
 ## Invariants — do not break these
@@ -143,6 +146,16 @@ Windows note: Python 3.13 (Anaconda) on this machine; tests run fine from Git Ba
   `"input screen"` (jailbreak verdict + route), `"context note"` (batched
   tagging: clauses in `<clause-NONCE id="cN">` tags, response
   `{"clauses": [{"id": "c1", ...}]}`), `"document-level metadata"` (profile).
+- **UI: untrusted text is never Markdown.** Clause text and model output go
+  through `ui/render.py` (html.escape → `st.html`) or `st.text`/`st.code`;
+  `st.markdown` would fetch a planted `![](https://…)`. The one
+  `unsafe_allow_html` is the constant CSS. Quote highlighting mirrors
+  `citation_validator._locate_quote` — change them together.
+- **UI entry is `ui/streamlit_app.py`, not `app.py`**: `ui/` goes on
+  `sys.path` (Streamlit and `tests/ui/conftest.py`), where an `app.py` would
+  shadow the backend `app` package. `tests/ui/conftest.py` also patches
+  AppTest's ButtonGroup (1.45 can't drive single-select pills /
+  segmented_control); drop the patch when Streamlit fixes it.
 - Retries: only 429 / 408 / 409 / 5xx / timeouts / bad JSON (`llm_client.is_retryable`);
   honour Retry-After. Upstream failures surface as HTTP 503, not 500.
 
@@ -401,8 +414,12 @@ and a comparison route that retrieves across versions of one agreement.
 ingestion calls); batch clauses per call; async ingestion job instead of a
 synchronous `POST /documents/text`; expose Docling upload.
 *Status 2026-09-30:* merge + batching **done** (8 passages/call), plus the
-response cache and unchanged-content skip. **Open:** async job, Docling
-upload, bounded concurrency behind a token-bucket limiter.
+response cache and unchanged-content skip. Upload **done but unverified**:
+`POST /documents/file` (.txt/.md decoded, .pdf/.docx via `DoclingLoader`,
+magic-byte check, 25 MB cap, 501 without Docling); Docling isn't installed
+locally, so the PDF path is tested with a fake loader only. **Open:** async
+job (the UI waits synchronously, up to 30 min), bounded concurrency behind a
+token-bucket limiter.
 
 **R13 — Clause parser residuals.** (2026-09-30: 53/510 docs at ≤ 2 clauses
 after the R13 + B7/B17 parser changes; the 183 below is the older count.)

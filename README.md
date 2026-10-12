@@ -37,6 +37,7 @@ Context for AI coding sessions: [`CLAUDE.md`](CLAUDE.md).
 - [Build order & status](#build-order--status)
 - [Known gaps](#known-gaps)
 - [Local development](#local-development)
+- [Web UI (Streamlit)](#web-ui-streamlit)
 - [Deployment (Docker Compose)](#deployment-docker-compose)
 - [API reference](#api-reference)
 - [Testing](#testing)
@@ -200,11 +201,13 @@ eval/
   cuad_preflight/               Stage 1: chunk_quality.py (containment + span precision + size vs. model limits)
   retrieval/                     cuad_recall.py — hit@k / span recall@k / char-budget recall on CUAD (R1, R3)
   golden_set/                    Stage 2: golden.py gate + unreviewed example set (lawyer review required)
-app/                          FastAPI service — /health, /documents/text, /query
+app/                          FastAPI service — /health, /documents*, /query, /reviews*
+ui/                           Streamlit UI (ask / review queue / documents); talks to the API over HTTP only
 embedding_server/            Standalone BGE-M3 service, own Dockerfile
 tests/
   ingestion/ query/ integration/  unit tests on fakes + real in-memory Qdrant round-trip
   app/                            HTTP tests: real app + in-memory Qdrant via dependency_overrides
+  ui/                             Streamlit pages driven by AppTest against the real app; quote-highlight unit tests
   eval/                           eval metric / gate tests
 docs/
   architecture.md               Full v3 design spec + as-built notes
@@ -255,9 +258,13 @@ Self-Querying Retriever, the recent case-law / external legal authority module.
   from 36% after R13 (indented headings + a guarded inline pass for flattened
   text); 39 of the 53 use roman-numeral, "(a)"-style or no numbering — see
   `ingestion/parsing/clause_parser.py`'s docstring for the measured before/after.
-- **Docling file upload isn't exposed over HTTP yet** — `POST /documents/text`
-  takes already-extracted text; `DoclingLoader` is built and ready, just not
-  wired to an upload endpoint.
+- **PDF/DOCX upload is wired but unverified** — `POST /documents/file` sends
+  `.pdf`/`.docx` through `DoclingLoader`, but Docling isn't installed on the
+  dev machine, so that path is tested with a fake loader only (`.txt`/`.md`
+  uploads are tested for real). Without Docling the endpoint returns 501.
+- **The Streamlit UI has no sign-in.** It calls the API with one server-side
+  key (`RAG_API_KEY`), so anyone who can open it acts with that key; it binds
+  to localhost for that reason. Real sign-in is R8 (OIDC).
 - **Docker Compose wasn't run end-to-end** in the environment this was built
   in (Docker CLI present, daemon not running) — syntactically validated via
   `docker compose config`, but build/run should be verified before relying on it.
@@ -269,6 +276,36 @@ cp .env.example .env      # fill in GROQ_API_KEY at minimum
 pip install -r requirements.txt
 pytest tests/             # no live services needed
 ```
+
+## Web UI (Streamlit)
+
+```bash
+pip install -r ui/requirements.txt
+uvicorn app.main:app                  # the API, as above (DEV_MODE=true for local, keyless use)
+cd ui && streamlit run streamlit_app.py   # http://localhost:8501
+```
+
+| Env var | Meaning |
+|---|---|
+| `RAG_API_URL` | API base URL (default `http://127.0.0.1:8000`) |
+| `RAG_API_KEY` | Sent as `X-API-Key` **from the Streamlit server**, never the browser. Leave unset against a `DEV_MODE` API. |
+| `RAG_TENANT_ID`, `RAG_MATTER_ID` | Sidebar defaults |
+
+- **Ask** — one question about one contract. The answer is numbered claims;
+  each claim's verbatim quote is highlighted inside the stored clause text
+  (located the same way the citation validator matches it). Refusals say why:
+  queued for a lawyer (with a status check that doesn't touch the reviewer's
+  clock), not found, or blocked / out of scope (rephrase).
+- **Review queue** — the lawyer's side of H1/H2: evidence the model saw
+  (injection-flagged clauses marked), retrieval trace, a decision per draft
+  claim (no approve-all), edits and added claims checked against the
+  validator before submitting, override reasons required where the backend
+  requires them, 409 when another reviewer decided first.
+- **Documents** — the matter's library, and ingest by upload or paste.
+
+Untrusted text (contract clauses, model output) is never rendered as
+Markdown — a planted image link would be fetched by the browser — only as
+escaped HTML (`ui/render.py`).
 
 ## Deployment (Docker Compose)
 
@@ -345,7 +382,20 @@ Runs the full retrieval → generation → citation-validation → CRAG pipeline
 Returns `404` if the tenant/matter combination has no matching document —
 including when a *different* tenant asks about a document that exists for
 someone else. That's the permission-first filter, verified through the actual
-HTTP surface (`tests/app/` is not in the repo yet — see [Known gaps](#known-gaps)).
+HTTP surface (`tests/app/`).
+
+### Documents and review endpoints used by the UI
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /documents/file` | Multipart upload (`file`, `document_id`, `tenant_id`, `matter_id`, `privilege_level`): `.txt`/`.md` (UTF-8), `.pdf`/`.docx` via Docling. 415 wrong type or magic bytes, 413 over 25 MB, 501 without Docling. |
+| `GET /documents?tenant_id&matter_id` | The matter's documents with document-level metadata (governing law, parties, privilege, clause count, injection flags). |
+| `GET /documents/{id}?tenant_id&matter_id` | Stored clauses in document order — the text citations are validated against — plus defined terms. Audited as `document_read`. |
+| `GET /reviews`, `GET /reviews/{id}`, `POST /reviews/{id}/decision` | Human review queue (see CLAUDE.md, R15). `GET /reviews/{id}` is the reviewer opening the case. |
+| `GET /reviews/{id}/status?tenant_id&matter_id` | For the asker: status + released outcome, without starting the reviewer's time-to-decision clock. |
+| `POST /reviews/{id}/check` | Validator verdict for each proposed decision, without deciding, saving or auditing. |
+
+All are matter-scoped like `/query`; a review outside the caller's scope is a 404.
 
 ### `GET /health`
 
@@ -358,6 +408,7 @@ pytest tests/                          # everything, ~6s, no live services
 pytest tests/ingestion/                # clause parsing, tagging, indexing
 pytest tests/query/                    # retrieval, CRAG, validation, guardrails
 pytest tests/integration/              # real qdrant-client (in-memory) round-trip
+pytest tests/ui/                       # Streamlit pages via AppTest against the real app
 python -m eval.cuad_preflight.chunk_quality   # 510-contract CUAD chunk-quality pass (needs the dataset)
 ```
 

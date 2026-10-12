@@ -9,6 +9,10 @@ bill):
   of which re-sends it.
 - `source_text` <= 2,000,000 chars: ~1,000 pages; far beyond the largest CUAD
   contract (~48k tokens, ~200k chars), with room for long credit agreements.
+- uploaded files <= 25 MB (`MAX_UPLOAD_BYTES`): a larger file is a 413
+  before any parsing or LLM work. Starlette has already spooled the body to
+  disk by then, so a hard cap on bytes received belongs in the reverse
+  proxy (`client_max_body_size`). Extracted text is held to 2,000,000 chars.
 - identifiers (`document_id`, `tenant_id`, `matter_id`) match
   `^[A-Za-z0-9._-]{1,128}$`. Beyond size, this keeps ids from colliding with
   the "::" separator inside clause ids (`<document_id>::clause-NNNN`,
@@ -24,12 +28,22 @@ from typing import Annotated
 
 from pydantic import BaseModel, Field
 
-from ingestion.schemas import PrivilegeLevel
-from query.review.schemas import ID_PATTERN, DecisionRequest, ReviewStatus
+from ingestion.schemas import DefinedTerm, PrivilegeLevel
+from query.review.schemas import (
+    ID_PATTERN,
+    MAX_DECISIONS,
+    ClaimDecision,
+    DecisionRequest,
+    ReviewOutcome,
+    ReviewStatus,
+)
 
 MAX_QUERY_CHARS = 4_000
 MAX_SOURCE_TEXT_CHARS = 2_000_000
 MAX_FILTER_VALUE_CHARS = 200
+# Uploaded files (POST /documents/file). A scanned 1,000-page PDF can exceed
+# this; the extracted text is still held to MAX_SOURCE_TEXT_CHARS.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 Identifier = Annotated[str, Field(pattern=ID_PATTERN)]
 
@@ -81,8 +95,9 @@ class QueryResponse(BaseModel):
     # claims ground at least two different clauses (crag_graph, B10).
     verdict: str | None = None
     disclaimer: str | None = None
-    # Set when the outcome was queued for human review: GET /reviews/{id}
-    # returns the reviewer's released answer once the case is resolved.
+    # Set when the outcome was queued for human review: GET
+    # /reviews/{id}/status returns the reviewer's released answer once the
+    # case is resolved.
     review_id: str | None = None
 
 
@@ -101,3 +116,54 @@ class ReviewSummary(BaseModel):
 class ReviewDecisionBody(DecisionRequest):
     tenant_id: Identifier
     matter_id: Identifier
+
+
+class ReviewCheckBody(BaseModel):
+    tenant_id: Identifier
+    matter_id: Identifier
+    decisions: list[ClaimDecision] = Field(max_length=MAX_DECISIONS)
+
+
+class ReviewStatusOut(BaseModel):
+    """What the asker polls after a queued query. Deliberately not the
+    ReviewCase: reading it doesn't start the reviewer's time-to-decision
+    clock (mark_viewed), and the evidence packet isn't the asker's concern."""
+
+    review_id: str
+    status: ReviewStatus
+    outcome: ReviewOutcome | None = None
+
+
+class DocumentSummary(BaseModel):
+    """Document-level fields are the value most of the document's clauses
+    carry: they're merged onto every clause from the document profile, and
+    a clause-level value can differ (CLAUDE.md #5)."""
+
+    document_id: str
+    num_clauses: int
+    privilege_level: PrivilegeLevel | None = None
+    contract_type: str | None = None
+    governing_law: str | None = None
+    jurisdiction: str | None = None
+    parties: list[str] = []
+    injection_flagged_clauses: int = 0
+
+
+class ClauseOut(BaseModel):
+    clause_id: str
+    section_id: str | None = None
+    heading: str | None = None
+    text: str
+    start_offset: int
+    end_offset: int
+    parent_clause_id: str | None = None
+    clause_type: str | None = None
+    injection_suspected: bool = False
+    injection_markers: list[str] = []
+
+
+class DocumentDetail(DocumentSummary):
+    # Document order (start_offset), as stored: the text citations are
+    # validated against.
+    clauses: list[ClauseOut]
+    defined_terms: list[DefinedTerm] = []

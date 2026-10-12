@@ -17,13 +17,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
 import time
 import urllib.error
 import uuid
+from collections import Counter
 from contextlib import asynccontextmanager
-from typing import Literal
+from pathlib import Path
+from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.dependencies import (
@@ -39,12 +42,19 @@ from app.dependencies import (
     scoped_llm_clients,
 )
 from app.schemas import (
+    MAX_SOURCE_TEXT_CHARS,
+    MAX_UPLOAD_BYTES,
     CitationOut,
+    ClauseOut,
+    DocumentDetail,
+    DocumentSummary,
     IngestResponse,
     IngestTextRequest,
     QueryRequest,
     QueryResponse,
+    ReviewCheckBody,
     ReviewDecisionBody,
+    ReviewStatusOut,
     ReviewSummary,
 )
 from ingestion.metadata.llm_client import LLMCallError
@@ -55,14 +65,15 @@ from query.generation.crag_graph import run_crag
 from query.pipeline import process_query
 from query.retrieval.bm25_search import InMemoryBM25Index
 from query.retrieval.reranker import PassthroughReranker
-from ingestion.schemas import PrivilegeLevel
+from ingestion.schemas import ClauseMetadata, PrivilegeLevel
 from query.filters.audit_log import AuditEvent
-from query.review.schemas import ReviewCase, ReviewStatus
+from query.review.schemas import ID_PATTERN, ReviewCase, ReviewedClaim, ReviewStatus
 from query.review.workflow import (
     ReviewConflictError,
     ReviewDecisionError,
     apply_decision,
     build_review_case,
+    check_claims,
     mark_viewed,
     should_queue,
 )
@@ -191,22 +202,24 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/documents/text", response_model=IngestResponse)
-def ingest_text(
-    request: IngestTextRequest,
-    deps: Dependencies = Depends(get_dependencies),
-    api_key: str | None = Depends(get_api_key),
-    client_host: str | None = Depends(get_client_host),
+def _ingest(
+    deps: Dependencies,
+    *,
+    document_id: str,
+    tenant_id: str,
+    matter_id: str,
+    privilege_level: PrivilegeLevel,
+    text: str,
+    source_path: str,
 ) -> IngestResponse:
-    authorize_request(request.tenant_id, request.matter_id, api_key, deps.settings, client_host)
-    llm_client, privileged_llm_client = scoped_llm_clients(deps, request.tenant_id, request.matter_id)
+    llm_client, privileged_llm_client = scoped_llm_clients(deps, tenant_id, matter_id)
     parsed = ingest_document(
-        document_id=request.document_id,
-        source_path="<inline>",
-        tenant_id=request.tenant_id,
-        matter_id=request.matter_id,
-        privilege_level=request.privilege_level,
-        document_loader=_InMemoryTextLoader(request.source_text),
+        document_id=document_id,
+        source_path=source_path,
+        tenant_id=tenant_id,
+        matter_id=matter_id,
+        privilege_level=privilege_level,
+        document_loader=_InMemoryTextLoader(text),
         llm_client=llm_client,
         embedding_client=deps.embedding_client,
         vector_store=deps.indexer,
@@ -219,6 +232,169 @@ def ingest_text(
         num_clauses=len(parsed.clauses),
         num_defined_terms=len(parsed.defined_terms),
         num_references=len(parsed.references),
+    )
+
+
+@app.post("/documents/text", response_model=IngestResponse)
+def ingest_text(
+    request: IngestTextRequest,
+    deps: Dependencies = Depends(get_dependencies),
+    api_key: str | None = Depends(get_api_key),
+    client_host: str | None = Depends(get_client_host),
+) -> IngestResponse:
+    authorize_request(request.tenant_id, request.matter_id, api_key, deps.settings, client_host)
+    return _ingest(
+        deps,
+        document_id=request.document_id,
+        tenant_id=request.tenant_id,
+        matter_id=request.matter_id,
+        privilege_level=request.privilege_level,
+        text=request.source_text,
+        source_path="<inline>",
+    )
+
+
+# Text formats are decoded here; binary formats go through Docling
+# (deps.document_loader). Each binary format must also start with its magic
+# bytes, so a renamed file never reaches the converter as something else.
+_TEXT_SUFFIXES = frozenset({".txt", ".md"})
+_BINARY_MAGIC = {".pdf": b"%PDF-", ".docx": b"PK\x03\x04"}
+
+
+def _extract_upload_text(deps: Dependencies, filename: str, data: bytes) -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix in _TEXT_SUFFIXES:
+        try:
+            return data.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=422, detail="Text files must be UTF-8") from exc
+    magic = _BINARY_MAGIC.get(suffix)
+    if magic is None:
+        supported = ", ".join(sorted(_TEXT_SUFFIXES | _BINARY_MAGIC.keys()))
+        raise HTTPException(status_code=415, detail=f"Unsupported file type; use one of {supported}")
+    if not data.startswith(magic):
+        raise HTTPException(status_code=415, detail=f"File content is not a valid {suffix} file")
+
+    # Docling reads from a path. Only the allow-listed suffix comes from the
+    # client; the filename itself never touches the filesystem.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / f"upload{suffix}"
+        path.write_bytes(data)
+        try:
+            return deps.document_loader.load(str(path))
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=501, detail="PDF/DOCX ingestion needs docling installed on the server"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 -- converter failures on a
+            # malformed file are the file's problem (422), whatever Docling
+            # raises; the detail stays generic and the cause goes to the log.
+            logger.warning("could not extract text from upload %r: %r", filename, exc, exc_info=exc)
+            raise HTTPException(status_code=422, detail="Could not extract text from this file") from exc
+
+
+@app.post("/documents/file", response_model=IngestResponse)
+def ingest_file(
+    file: Annotated[UploadFile, File()],
+    document_id: Annotated[str, Form(pattern=ID_PATTERN)],
+    tenant_id: Annotated[str, Form(pattern=ID_PATTERN)],
+    matter_id: Annotated[str, Form(pattern=ID_PATTERN)],
+    privilege_level: Annotated[PrivilegeLevel, Form()] = PrivilegeLevel.CONFIDENTIAL,
+    deps: Dependencies = Depends(get_dependencies),
+    api_key: str | None = Depends(get_api_key),
+    client_host: str | None = Depends(get_client_host),
+) -> IngestResponse:
+    """Contract file upload (roadmap R12): .txt/.md as UTF-8, .pdf/.docx via
+    Docling. Authorized before the file is decoded or converted."""
+    authorize_request(tenant_id, matter_id, api_key, deps.settings, client_host)
+    data = file.file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"File exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+    text = _extract_upload_text(deps, file.filename or "", data)
+    if len(text) > MAX_SOURCE_TEXT_CHARS:
+        raise HTTPException(status_code=413, detail=f"Extracted text exceeds {MAX_SOURCE_TEXT_CHARS:,} characters")
+    return _ingest(
+        deps,
+        document_id=document_id,
+        tenant_id=tenant_id,
+        matter_id=matter_id,
+        privilege_level=privilege_level,
+        text=text,
+        source_path=file.filename or "<upload>",
+    )
+
+
+def _most_common(values) -> str | None:
+    counts = Counter(v for v in values if v)
+    return counts.most_common(1)[0][0] if counts else None
+
+
+def _document_summary(document_id: str, metadata: list[ClauseMetadata]) -> DocumentSummary:
+    parties = Counter(tuple(m.parties) for m in metadata if m.parties)
+    return DocumentSummary(
+        document_id=document_id,
+        num_clauses=len(metadata),
+        privilege_level=_most_common(m.privilege_level for m in metadata),
+        contract_type=_most_common(m.contract_type for m in metadata),
+        governing_law=_most_common(m.governing_law for m in metadata),
+        jurisdiction=_most_common(m.jurisdiction for m in metadata),
+        parties=list(parties.most_common(1)[0][0]) if parties else [],
+        injection_flagged_clauses=sum(m.injection_suspected for m in metadata),
+    )
+
+
+@app.get("/documents", response_model=list[DocumentSummary])
+def list_documents(
+    tenant_id: str,
+    matter_id: str,
+    deps: Dependencies = Depends(get_dependencies),
+    api_key: str | None = Depends(get_api_key),
+    client_host: str | None = Depends(get_client_host),
+) -> list[DocumentSummary]:
+    authorize_request(tenant_id, matter_id, api_key, deps.settings, client_host)
+    documents = deps.document_reader.list_documents(tenant_id=tenant_id, matter_id=matter_id)
+    return [_document_summary(document_id, metadata) for document_id, metadata in documents.items()]
+
+
+@app.get("/documents/{document_id}", response_model=DocumentDetail)
+def get_document(
+    document_id: str,
+    tenant_id: str,
+    matter_id: str,
+    deps: Dependencies = Depends(get_dependencies),
+    api_key: str | None = Depends(get_api_key),
+    client_host: str | None = Depends(get_client_host),
+) -> DocumentDetail:
+    """The stored clause text -- exactly what citations are validated
+    against -- so a client can show each quote in its clause. Privileged
+    text is returned too: privilege restricts which LLM may read it, not the
+    matter's own credential holders. Reads of full text are audited."""
+    authorize_request(tenant_id, matter_id, api_key, deps.settings, client_host)
+    context = deps.document_reader.load_document(document_id, tenant_id=tenant_id, matter_id=matter_id)
+    if not context.clauses:
+        raise HTTPException(status_code=404, detail="Document not found for this tenant/matter")
+    ActorAuditLogger(deps.audit_logger, actor_id(api_key, deps.settings)).log(
+        AuditEvent(
+            event_type="document_read",
+            tenant_id=tenant_id,
+            matter_id=matter_id,
+            details={"document_id": document_id},
+        )
+    )
+    metadata = context.clause_metadata_by_id
+    summary = _document_summary(document_id, [metadata[c.clause_id] for c in context.clauses])
+    return DocumentDetail(
+        **summary.model_dump(),
+        clauses=[
+            ClauseOut(
+                **clause.model_dump(),
+                clause_type=metadata[clause.clause_id].clause_type,
+                injection_suspected=metadata[clause.clause_id].injection_suspected,
+                injection_markers=metadata[clause.clause_id].injection_markers,
+            )
+            for clause in context.clauses
+        ],
+        defined_terms=context.defined_terms,
     )
 
 
@@ -430,6 +606,50 @@ def get_review(
     # so a stale view can't reopen a decided case (B16).
     mark_viewed(case, store=deps.review_store)
     return case
+
+
+@app.get("/reviews/{review_id}/status", response_model=ReviewStatusOut)
+def get_review_status(
+    review_id: str,
+    tenant_id: str,
+    matter_id: str,
+    deps: Dependencies = Depends(get_dependencies),
+    api_key: str | None = Depends(get_api_key),
+    client_host: str | None = Depends(get_client_host),
+) -> ReviewStatusOut:
+    """For the asker polling a queued query. GET /reviews/{id} is the
+    reviewer opening the case and starts the time-to-decision clock (H2);
+    polling it would make every case look rubber-stamped."""
+    authorize_request(tenant_id, matter_id, api_key, deps.settings, client_host)
+    case = _scoped_case(deps, review_id, tenant_id, matter_id)
+    return ReviewStatusOut(review_id=case.review_id, status=case.status, outcome=case.outcome)
+
+
+@app.post("/reviews/{review_id}/check", response_model=list[ReviewedClaim])
+def check_review_claims(
+    review_id: str,
+    body: ReviewCheckBody,
+    deps: Dependencies = Depends(get_dependencies),
+    api_key: str | None = Depends(get_api_key),
+    client_host: str | None = Depends(get_client_host),
+) -> list[ReviewedClaim]:
+    """Validator verdict for each proposed decision, without deciding: the
+    decision endpoint stops at the first failing claim, so a reviewer
+    editing several would otherwise learn about them one submit at a time."""
+    authorize_request(body.tenant_id, body.matter_id, api_key, deps.settings, client_host)
+    case = _scoped_case(deps, review_id, body.tenant_id, body.matter_id)
+    document_context = deps.document_reader.load_document(
+        case.document_id, tenant_id=case.tenant_id, matter_id=case.matter_id
+    )
+    try:
+        return check_claims(
+            case,
+            body.decisions,
+            all_clauses_by_id=document_context.by_clause_id(),
+            entailment_checker=deps.entailment_checker,
+        )
+    except ReviewDecisionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/reviews/{review_id}/decision", response_model=ReviewCase)

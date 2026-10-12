@@ -343,3 +343,182 @@ def test_reviews_can_be_listed_across_all_statuses(make_client):
     _query(client, governing_law="California")
     assert len(_reviews(client, status="all").json()) == 1
     assert _reviews(client, status="resolved").json() == []
+
+
+# --- Endpoints a UI needs: document list / detail, upload, review status ---
+
+
+def _documents(client, path="", matter="m-1", headers=None):
+    return client.get(
+        f"/documents{path}", params={"tenant_id": "t-1", "matter_id": matter}, headers=headers or {}
+    )
+
+
+def test_documents_are_listed_per_matter_with_document_level_metadata(make_client):
+    client, _ = make_client()
+    assert _documents(client).json() == []
+    num_clauses = _ingest(client).json()["num_clauses"]
+
+    [doc] = _documents(client).json()
+    assert doc["document_id"] == "msa-1"
+    assert doc["num_clauses"] == num_clauses
+    assert doc["governing_law"] == "delaware"  # normalized, merged from the profile
+    assert doc["privilege_level"] == "confidential"
+    assert _documents(client, matter="m-2").json() == []
+
+
+def test_document_detail_returns_stored_clauses_in_order_and_is_audited(make_client):
+    client, deps = make_client()
+    _ingest(client)
+    citation = _query(client).json()["citations"][0]
+
+    response = _documents(client, "/msa-1")
+    assert response.status_code == 200
+    clauses = response.json()["clauses"]
+    offsets = [c["start_offset"] for c in clauses]
+    assert offsets == sorted(offsets)
+    cited = next(c for c in clauses if c["clause_id"] == citation["clause_id"])
+    assert citation["supporting_quote"] in cited["text"]
+    assert any(e.event_type == "document_read" for e in deps.audit_logger.events)
+
+    assert _documents(client, "/msa-1", matter="m-2").status_code == 404
+    assert _documents(client, "/nope").status_code == 404
+
+
+def test_document_routes_are_matter_scoped(make_client):
+    settings = Settings(api_keys={"k-scoped": {"tenant_id": "t-1", "matters": ["m-1"]}})
+    client, _ = make_client(settings)
+    headers = {"X-API-Key": "k-scoped"}
+    _ingest(client, headers=headers)
+
+    assert _documents(client).status_code == 401
+    assert len(_documents(client, headers=headers).json()) == 1
+    assert _documents(client, matter="m-2", headers=headers).status_code == 403
+    assert _documents(client, "/msa-1", matter="m-2", headers=headers).status_code == 403
+
+
+def _upload(client, filename, data, *, document_id="msa-up"):
+    return client.post(
+        "/documents/file",
+        data={"document_id": document_id, "tenant_id": "t-1", "matter_id": "m-1"},
+        files={"file": (filename, data)},
+    )
+
+
+def test_text_upload_ingests_like_the_text_endpoint(make_client):
+    client, _ = make_client()
+    expected = _ingest(client).json()["num_clauses"]
+    response = _upload(client, "msa.txt", ("﻿" + CONTRACT).encode("utf-8"))
+    assert response.status_code == 200
+    assert response.json()["num_clauses"] == expected
+
+
+def test_upload_rejects_bad_type_content_encoding_and_size(make_client, monkeypatch):
+    import app.main as main
+
+    client, deps = make_client()
+    assert _upload(client, "msa.exe", b"MZ").status_code == 415
+    assert _upload(client, "msa.pdf", b"not a pdf").status_code == 415  # magic bytes
+    assert _upload(client, "msa.txt", "é".encode("latin-1")).status_code == 422
+    assert _upload(client, "msa.txt", CONTRACT.encode(), document_id="bad id!").status_code == 422
+
+    monkeypatch.setattr(main, "MAX_UPLOAD_BYTES", 100)
+    assert _upload(client, "msa.txt", CONTRACT.encode()).status_code == 413
+    assert deps.llm_client.user_prompts == []
+
+
+def test_pdf_upload_goes_through_the_document_loader(make_client):
+    seen = {}
+
+    class FakeDocling:
+        def load(self, source_path):
+            path = Path(source_path)
+            seen["suffix"], seen["existed"], seen["path"] = path.suffix, path.exists(), path
+            return CONTRACT
+
+    client, deps = make_client()
+    deps.document_loader = FakeDocling()
+    response = _upload(client, "../../etc/msa.pdf", b"%PDF-1.7 ...")
+    assert response.status_code == 200
+    assert response.json()["num_clauses"] > 1
+    assert seen["suffix"] == ".pdf" and seen["existed"]
+    assert seen["path"].name == "upload.pdf"  # client filename never used as a path
+    assert not seen["path"].exists()  # temp file cleaned up
+
+
+def test_pdf_upload_without_docling_is_501_and_bad_pdf_is_422(make_client):
+    class NoDocling:
+        def load(self, source_path):
+            raise ImportError("No module named 'docling'")
+
+    class BrokenPdf:
+        def load(self, source_path):
+            raise ValueError("corrupt xref table")
+
+    client, deps = make_client()
+    deps.document_loader = NoDocling()
+    assert _upload(client, "msa.pdf", b"%PDF-1.7").status_code == 501
+    deps.document_loader = BrokenPdf()
+    response = _upload(client, "msa.pdf", b"%PDF-1.7")
+    assert response.status_code == 422
+    assert "xref" not in response.json()["detail"]
+
+
+def test_review_status_polling_does_not_start_the_reviewer_clock(make_client):
+    client, deps = make_client()
+    _ingest(client)
+    law_clause = _query(client).json()["citations"][0]["clause_id"]
+    review_id = _query(client, governing_law="California").json()["review_id"]
+
+    status = _reviews(client, f"/{review_id}/status").json()
+    assert status == {"review_id": review_id, "status": "open", "outcome": None}
+    assert deps.review_store.get(review_id).first_viewed_at is None
+    assert _reviews(client, f"/{review_id}/status", matter="m-2").status_code == 404
+
+    client.post(
+        f"/reviews/{review_id}/decision",
+        json={
+            "tenant_id": "t-1",
+            "matter_id": "m-1",
+            "reviewer": "a.lawyer",
+            "decisions": [
+                {"index": None, "action": "edit", "citation": law_clause, "claim_text": _CLAIM, "supporting_quote": _QUOTE}
+            ],
+        },
+    )
+    status = _reviews(client, f"/{review_id}/status").json()
+    assert status["status"] == "resolved"
+    assert status["outcome"]["answer_text"] == _CLAIM
+
+
+def test_claim_check_reports_every_claim_without_deciding(make_client):
+    client, deps = make_client()
+    _ingest(client)
+    law_clause = _query(client).json()["citations"][0]["clause_id"]
+    review_id = _query(client, governing_law="California").json()["review_id"]
+
+    def check(decisions):
+        return client.post(
+            f"/reviews/{review_id}/check",
+            json={"tenant_id": "t-1", "matter_id": "m-1", "decisions": decisions},
+        )
+
+    edit = {"index": None, "action": "edit", "citation": law_clause}
+    response = check([
+        {**edit, "claim_text": _CLAIM, "supporting_quote": _QUOTE},
+        {**edit, "claim_text": "California law governs.", "supporting_quote": "the laws of the State of California"},
+    ])
+    assert response.status_code == 200
+    good, bad = response.json()
+    assert good["validator_passed"] is True and good["resolved_clause_id"] == law_clause
+    assert bad["validator_passed"] is False and bad["failure_reason"]
+
+    case = deps.review_store.get(review_id)
+    assert case.status.value == "open" and case.outcome is None and case.first_viewed_at is None
+    assert not any(e.event_type == "review_decision" for e in deps.audit_logger.events)
+
+    assert check([{"index": 99, "action": "approve"}]).status_code == 422
+    assert check([{**edit, "claim_text": _CLAIM}]).status_code == 422  # incomplete edit
+    assert client.post(
+        f"/reviews/{review_id}/check", json={"tenant_id": "t-1", "matter_id": "m-2", "decisions": []}
+    ).status_code == 404

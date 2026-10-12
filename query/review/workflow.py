@@ -173,57 +173,17 @@ def apply_decision(
     _check_decision_coverage(case, request)
 
     drafts = {d.index: d for d in case.draft_claims}
-    source_clauses = [clause for clause, _ in all_clauses_by_id.values()]
-    shown_clauses = [
-        RetrievedClause(clause=clause, metadata=metadata, score=0.0, source="review")
-        for clause, metadata in all_clauses_by_id.values()
-    ]
+    validate = _claim_validator(all_clauses_by_id, entailment_checker)
 
     reviewed: list[ReviewedClaim] = []
     for decision in request.decisions:
-        claim = _decided_claim(decision, drafts)
-        if decision.action == ClaimAction.REJECT:
-            reviewed.append(
-                ReviewedClaim(
-                    index=decision.index,
-                    action=decision.action,
-                    claim_text=claim.claim_text,
-                    citation=claim.citation_section_id,
-                    supporting_quote=claim.supporting_quote,
-                    validator_passed=False,
-                    override_reason=decision.override_reason,
-                )
-            )
-            continue
-        result = validate_citation(
-            Citation(
-                section_id=claim.citation_section_id,
-                claim_text=claim.claim_text,
-                supporting_quote=claim.supporting_quote,
-            ),
-            source_clauses=source_clauses,
-            shown_clauses=shown_clauses,
-            entailment_checker=entailment_checker,
-        )
-        override = (decision.override_reason or "").strip() or None
-        if not result.is_valid and override is None:
+        claim = _review_claim(decision, drafts, validate)
+        if claim.action != ClaimAction.REJECT and not claim.validator_passed and claim.override_reason is None:
             raise ReviewDecisionError(
-                f"Claim {_label(decision)} fails citation validation ({result.failure_reason}); "
+                f"Claim {_label(decision)} fails citation validation ({claim.failure_reason}); "
                 "fix it, reject it, or give an override_reason."
             )
-        reviewed.append(
-            ReviewedClaim(
-                index=decision.index,
-                action=decision.action,
-                claim_text=claim.claim_text,
-                citation=claim.citation_section_id,
-                supporting_quote=claim.supporting_quote,
-                resolved_clause_id=result.resolved_clause_id,
-                validator_passed=result.is_valid,
-                failure_reason=result.failure_reason,
-                override_reason=override if not result.is_valid else None,
-            )
-        )
+        reviewed.append(claim)
 
     accepted = [r for r in reviewed if r.action != ClaimAction.REJECT]
     decided_at = _now()
@@ -249,6 +209,84 @@ def apply_decision(
         store.record_decision(case)  # raises ReviewAlreadyDecided if a concurrent decision won
     _audit(case, audit_logger)
     return case
+
+
+def check_claims(
+    case: ReviewCase,
+    decisions: list[ClaimDecision],
+    *,
+    all_clauses_by_id: dict[str, tuple[Clause, ClauseMetadata]],
+    entailment_checker: EntailmentChecker | None = None,
+) -> list[ReviewedClaim]:
+    """Dry run of apply_decision's per-claim validation, for a reviewer
+    checking edits before deciding: same validator, same current document,
+    but nothing is decided, saved or audited, the case isn't marked viewed,
+    and decisions needn't cover every draft. A failing claim comes back
+    with validator_passed=False rather than raising, so every claim's
+    verdict is visible at once. A malformed decision (unknown index, an
+    incomplete edit) still raises ReviewDecisionError."""
+    drafts = {d.index: d for d in case.draft_claims}
+    validate = _claim_validator(all_clauses_by_id, entailment_checker)
+    for decision in decisions:
+        if decision.index is not None and decision.index not in drafts:
+            raise ReviewDecisionError(f"No draft claim with index {decision.index}")
+        if decision.index is None and decision.action != ClaimAction.EDIT:
+            raise ReviewDecisionError("A reviewer-added claim (no index) must use action 'edit'")
+    return [_review_claim(decision, drafts, validate) for decision in decisions]
+
+
+def _claim_validator(
+    all_clauses_by_id: dict[str, tuple[Clause, ClauseMetadata]],
+    entailment_checker: EntailmentChecker | None,
+):
+    source_clauses = [clause for clause, _ in all_clauses_by_id.values()]
+    shown_clauses = [
+        RetrievedClause(clause=clause, metadata=metadata, score=0.0, source="review")
+        for clause, metadata in all_clauses_by_id.values()
+    ]
+
+    def validate(claim: Claim):
+        return validate_citation(
+            Citation(
+                section_id=claim.citation_section_id,
+                claim_text=claim.claim_text,
+                supporting_quote=claim.supporting_quote,
+            ),
+            source_clauses=source_clauses,
+            shown_clauses=shown_clauses,
+            entailment_checker=entailment_checker,
+        )
+
+    return validate
+
+
+def _review_claim(decision: ClaimDecision, drafts: dict[int, DraftClaim], validate) -> ReviewedClaim:
+    """One decision as decided: rejected claims aren't validated; any other
+    is re-validated, and its override_reason is kept only if it fails."""
+    claim = _decided_claim(decision, drafts)
+    if decision.action == ClaimAction.REJECT:
+        return ReviewedClaim(
+            index=decision.index,
+            action=decision.action,
+            claim_text=claim.claim_text,
+            citation=claim.citation_section_id,
+            supporting_quote=claim.supporting_quote,
+            validator_passed=False,
+            override_reason=decision.override_reason,
+        )
+    result = validate(claim)
+    override = (decision.override_reason or "").strip() or None
+    return ReviewedClaim(
+        index=decision.index,
+        action=decision.action,
+        claim_text=claim.claim_text,
+        citation=claim.citation_section_id,
+        supporting_quote=claim.supporting_quote,
+        resolved_clause_id=result.resolved_clause_id,
+        validator_passed=result.is_valid,
+        failure_reason=result.failure_reason,
+        override_reason=override if not result.is_valid else None,
+    )
 
 
 def _check_decision_coverage(case: ReviewCase, request: DecisionRequest) -> None:

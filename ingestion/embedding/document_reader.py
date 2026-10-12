@@ -138,6 +138,47 @@ class QdrantDocumentReader:
             defined_terms=defined_terms,
         )
 
+    def list_documents(self, *, tenant_id: str, matter_id: str) -> dict[str, list[ClauseMetadata]]:
+        """document_id -> the metadata of each of its clause points, for one
+        tenant + matter. Scrolls metadata fields only (no text, no vectors):
+        one pass over the matter's clause points, fine at matter scale
+        (tens of contracts); a per-matter document registry would replace it
+        if matters grow to thousands of documents.
+
+        Reference / defined-term points are excluded with must_not rather
+        than must record_type == "clause", so pre-record_type payloads are
+        listed exactly as load_document reads them (as clauses)."""
+        from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue  # lazy import
+
+        client = self._client_instance()
+        scroll_filter = Filter(
+            must=[
+                FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id)),
+                FieldCondition(key="matter_id", match=MatchValue(value=matter_id)),
+            ],
+            must_not=[FieldCondition(key="record_type", match=MatchAny(any=["reference", "defined_term"]))],
+        )
+        fields = ["document_id", *ClauseMetadata.model_fields]
+
+        documents: dict[str, list[ClauseMetadata]] = defaultdict(list)
+        offset = None
+        while True:
+            points, offset = client.scroll(
+                collection_name=self._collection_name,
+                scroll_filter=scroll_filter,
+                limit=1024,
+                offset=offset,
+                with_payload=fields,
+                with_vectors=False,
+            )
+            for point in points:
+                payload = point.payload or {}
+                metadata_fields = {k: v for k, v in payload.items() if k in ClauseMetadata.model_fields}
+                documents[payload["document_id"]].append(ClauseMetadata(**metadata_fields))
+            if offset is None:
+                break
+        return dict(sorted(documents.items()))
+
 
 def _point_to_clause_and_metadata(payload: dict) -> tuple[Clause, ClauseMetadata]:
     clause = Clause(
