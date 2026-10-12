@@ -1,0 +1,4 @@
+# Streamlit UI -- separate from the API's requirements.txt: it talks to the
+# API over HTTP and imports nothing from the backend packages.
+streamlit>=1.45,<2   # st.navigation, st.badge, st.pills, dataframe row selection
+httpx>=0.28,<1

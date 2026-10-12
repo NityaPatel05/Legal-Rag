@@ -1,0 +1,19 @@
+# Read when streamlit is started from this directory (cd ui && streamlit run streamlit_app.py).
+
+[server]
+# The UI calls the API with the server-side RAG_API_KEY, so whoever can open
+# this page acts with that key. Localhost only until real sign-in (R8) sits
+# in front of it.
+address = "localhost"
+port = 8501
+# Uploads are forwarded to POST /documents/file, which caps them at 25 MB.
+maxUploadSize = 25
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+
+[theme]
+primaryColor = "#3b5bdb"
